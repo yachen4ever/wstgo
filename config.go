@@ -31,7 +31,8 @@ type GeneralConfig struct {
 	AuthDir       string `toml:"auth_dir"`       // server: 授权公钥目录
 	URL           string `toml:"url"`            // client: 服务端基础 URL，实际连接 <url>/<标签>
 	Key           string `toml:"key"`            // client: 私钥路径
-	AllowInsecure bool   `toml:"allow_insecure"` // client: 跳过 TLS 证书校验（自签名 wss）
+	AllowInsecure bool   `toml:"allow_insecure"` // client: 跳过 TLS 证书校验（自签名 wss，仅临时调试）
+	Cacert        string `toml:"cacert"`         // client: CA 证书文件（PEM/DER），标准校验自签 wss 服务端；与 allow_insecure 互斥
 }
 
 type ServerForward struct {
@@ -93,6 +94,9 @@ func (c *Config) validate() error {
 		}
 		if c.General.Key == "" {
 			return errors.New("config: general.key is required")
+		}
+		if c.General.AllowInsecure && c.General.Cacert != "" {
+			return errors.New("config: general.allow_insecure and general.cacert are mutually exclusive (pick one way to trust the server)")
 		}
 		if len(c.Client) == 0 {
 			return errors.New("config: at least one [client.<label>] forward is required")

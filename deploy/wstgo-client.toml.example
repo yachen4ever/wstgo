@@ -8,7 +8,10 @@ run_mode = "client"
 url = "wss://tunnel.example.com/ws"
 # 本机私钥（wstgo genkey 生成，私钥永不上传）
 key = "/etc/wstgo/client/private.pem"
-# 服务端 wss 用自签名证书且不便导入 CA 时置 true（ed25519 鉴权不受影响）
+# 服务端 wss 用自签 CA 时（推荐）：cacert 指定签发服务端证书的 CA 根证书
+# （PEM/DER），走标准链 + 主机名校验，叶子证书 SAN 需含连接用的 IP/域名
+#cacert = "/etc/wstgo/ca-root.crt"
+# 临时调试才用：跳过全部 TLS 校验（有主动中间人风险），与 cacert 互斥
 allow_insecure = false
 
 [client]

@@ -36,6 +36,7 @@
 - **心跳保活**：客户端每 10 秒发送 WebSocket Ping，双方在收到任意 Ping/Pong 时续约读超时（30 秒无消息即断开），能穿过反向代理的空闲断连策略；DB 等场景下隧道故障会快速暴露给应用，便于连接池及时重连。
 - **指数退避重连**：客户端 WS 拨号失败时按 1s→2s→4s→8s 指数退避重试，最多尝试 5 次（累计最长等待约 15 秒；404 标签不匹配除外，立即失败并提示）。
 - **原生 wss 可选**：`-tlscert/-tlskey` 让 wstgo 自身终结 TLS（仅 CLI 模式），无需前置反代即可对外提供 `wss://`；默认关闭，保持「nginx 终止 TLS」的推荐形态不变。
+- **服务端证书校验**：客户端 `-cacert` 指定 CA 证书，对自签 `wss://` 服务端走标准 X.509 校验（链 + 有效期 + 主机名/SAN），替代 `-insecure` 的盲连；证书校验失败与 404 一样快速失败不重试。
 
 ## 快速开始：配置文件模式（推荐）
 
@@ -81,7 +82,7 @@ wstgo run -config server.toml
 run_mode = "client"
 url = "wss://tunnel.example.com/ws"   # 基础路径，实际连接 <url>/<标签>
 key = "/etc/wstgo/client/private.pem"
-allow_insecure = false                # wss + 自签名证书时置 true
+cacert = "/etc/wstgo/ca-root.crt"     # 校验自签 wss 服务端的 CA 证书（推荐，见「自签名证书」）；与 allow_insecure 互斥
 
 [client.ssh1]
 bind = "127.0.0.1:50022"
@@ -122,7 +123,8 @@ Host myvps
 | `auth_dir` | server | 是 | — | 授权公钥目录，见「白名单管理」 |
 | `url` | client | 是 | — | 服务端基础 URL（`ws://` 或 `wss://`），实际连接 `<url>/<标签>` |
 | `key` | client | 是 | — | 客户端私钥文件路径 |
-| `allow_insecure` | client | 否 | `false` | `wss://` + 自签名证书时跳过 TLS 证书校验（ed25519 鉴权不受影响） |
+| `cacert` | client | 否 | — | CA 证书文件路径（PEM/DER），用标准 X.509 语义校验自签 `wss://` 服务端（链 + 有效期 + 主机名/SAN）；**与 `allow_insecure` 互斥**，见「自签名证书」 |
+| `allow_insecure` | client | 否 | `false` | 跳过全部 TLS 校验（仅临时调试，有主动中间人风险）；**与 `cacert` 互斥** |
 
 ### `[server.<标签>]` / `[client.<标签>]` 转发段
 
@@ -195,8 +197,9 @@ wstgo client -bind 127.0.0.1:2222 -url wss://tunnel.example.com/ws -key ./privat
 - `-bind`     客户端本地监听的 TCP 地址（默认 `127.0.0.1:25565`）
 - `-url`      服务端的 WebSocket URL（必填，支持 `ws://` 和 `wss://`）
 - `-key`      客户端私钥文件路径（默认 `./private.pem`）
+- `-cacert`   CA 证书文件（PEM/DER），标准校验自签 `wss://` 服务端（推荐，见下文「自签名证书」；与 `-insecure` 互斥）
 - `-v`        打印每个字节方向的流量日志（默认关闭，详见下文「日志」一节）
-- `-insecure` 跳过 TLS 证书验证（仅用于 `wss://` + 自签名证书场景，见下文「自签名证书与 `-insecure` 参数」一节）
+- `-insecure` 跳过 TLS 证书校验（仅临时调试用，见下文「自签名证书」一节）
 
 ### 原生 wss（不前置反代的场景）
 
@@ -328,21 +331,23 @@ server {
 - **日志里的 client IP 是 nginx 的**：经反代后 wstgo 看到的 `r.RemoteAddr` 是 `127.0.0.1`。nginx 配的 `X-Real-IP` / `X-Forwarded-For` 头可用于审计（当前 wstgo 尚未读取这些头）。
 - **慎用 Cloudflare 等 CDN**：免费版对 WS 有空闲断连限制且会限制子协议，wstgo 走 CDN 多半不行，建议直连或自建反代。
 
-### 自签名证书与 `-insecure` 参数
+### 自签名证书：`-cacert` / 系统信任库 / `-insecure`
 
-当 TLS 由 nginx 终止、或由 wstgo 原生提供（`-tlscert/-tlskey`），且证书为自签名（内网无域名、无公共 CA 场景）时，wstgo 客户端走 Go 标准 TLS 校验会因证书链不受信任而拨号失败（报 `x509: certificate signed by unknown authority`）。
+服务端 TLS 由自签 CA 签发的证书终结（典型形态：本地 CA 签一张带 IP/域名 SAN 的服务端证书，nginx 终结 TLS）时，客户端有三种做法，推荐程度从高到低：
 
-有两种解决方式：
+1. **`-cacert` 指定 CA 证书（推荐，零系统配置）**：客户端带上签发服务端证书的 CA 根证书文件（PEM 或 DER），走标准 X.509 校验——证书链、有效期、主机名/SAN 全部校验。中间人没有 CA 私钥，就造不出能通过校验的证书；比导入系统信任库影响面小（只信任这一个 CA，不动系统证书池）。
 
-1. **`-insecure` / `allow_insecure`（零客户端配置）**：拨号时跳过 TLS 证书验证。适合客户端机器不便导入 CA 证书的场景。
    ```bash
-   wstgo client -url wss://tunnel.example.com/ws -key ./private.pem -insecure
+   wstgo client -url wss://203.0.113.10:1985/ws -key ./private.pem -cacert local-ca-root.crt
    ```
-   仅跳过 TLS 层证书校验，WebSocket 之上的 ed25519 鉴权照常进行，安全性由挑战-响应保证。
 
-2. **导入 CA 到系统信任库**：把签发证书的 CA 根证书导入客户端系统信任库（Windows 用 `certutil -addstore Root ca.crt`，Linux 放入 `/usr/local/share/ca-certificates/`），Go 1.18+ 会自动读取系统证书池，无需 `-insecure`。
+   配置文件模式对应 `cacert = "/path/to/ca-root.crt"`。**`-cacert` 与 `-insecure` 互斥**，同时给出直接报错退出。
 
-两种方式任选其一。内网临时调试场景推荐 `-insecure` 省事；长期正式环境推荐导入 CA。
+   **SAN 注意事项**：标准校验包含主机名——直连 IP 时叶子证书的 SAN 必须包含这个 IP，否则即便信任了 CA 也会报 `certificate is valid for ... not <IP>`。签发服务端证书时把 IP 写进 SAN 即可（自签 CA 场景这是无代价的）。检查现有证书：`openssl x509 -in leaf.crt -noout -ext subjectAltName`。
+
+2. **导入系统信任库**：把 CA 根证书装进客户端系统（Windows 用 `certutil -addstore Root ca.crt`，Linux 放入 `/usr/local/share/ca-certificates/`），Go 1.18+ 自动读取，无需任何参数。适合这台机器上还有别的工具也要信任同一 CA 的场景。
+
+3. **`-insecure`（仅临时调试）**：跳过全部 TLS 校验。它**关掉的只是服务端身份认证，加密仍在**——被动偷听拿不到内容，但主动中间人可以先与客户端完成 TLS，再向真实服务端发起一条中继连接、原样转发 ed25519 握手（签名只覆盖 nonce、与 TLS 通道无绑定，中继无法被检测），握手照常通过，随后窃听/篡改全部隧道流量。只用于内网临时排查，不要长期运行；长期场景用 `-cacert` 或导入信任库。
 
 ## 部署：systemd 常驻
 
@@ -366,7 +371,7 @@ sudo systemctl enable --now wstgo-server
 go test -race ./...
 ```
 
-测试覆盖：TOML 配置加载与校验、密钥生成/加载/权限、白名单加载与热加载语义（新增拾取、移除吊销、读盘失败保留、限流）、鉴权握手协议（成功/未知公钥/坏签名/畸形帧/空白名单/超时/热加载拾取）、端到端隧道（真实 TCP echo 双向、128KB 多帧、并发连接、配置模式路由与 404、重连退避）。CI 在每次 push/PR 上跑 vet + `-race` 测试 + 交叉编译。
+测试覆盖：TOML 配置加载与校验、密钥生成/加载/权限、白名单加载与热加载语义（新增拾取、移除吊销、读盘失败保留、限流）、鉴权握手协议（成功/未知公钥/坏签名/畸形帧/空白名单/超时/热加载拾取）、端到端隧道（真实 TCP echo 双向、128KB 多帧、并发连接、配置模式路由与 404、重连退避）、TLS 服务端校验（cacert 标准链 + IP SAN、错误 CA 拒绝、无 SAN 主机名不匹配、证书错误快速失败、insecure 回归）。CI 在每次 push/PR 上跑 vet + `-race` 测试 + 交叉编译。
 
 ## 编译
 

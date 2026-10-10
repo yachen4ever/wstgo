@@ -54,7 +54,8 @@ func TestLoadClientConfig(t *testing.T) {
 run_mode = "client"
 url = "wss://tunnel.example.com/ws"
 key = "/etc/wstgo/client/private.pem"
-allow_insecure = true
+allow_insecure = false
+cacert = "/etc/wstgo/ca-root.crt"
 
 [client.ssh1]
 bind = "127.0.0.1:50022"
@@ -68,8 +69,11 @@ bind = "127.0.0.1:55432"
 		t.Fatalf("loadConfig: %v", err)
 	}
 	if cfg.General.RunMode != "client" || cfg.General.URL != "wss://tunnel.example.com/ws" ||
-		cfg.General.Key != "/etc/wstgo/client/private.pem" || !cfg.General.AllowInsecure {
+		cfg.General.Key != "/etc/wstgo/client/private.pem" || cfg.General.AllowInsecure {
 		t.Fatalf("general section mismatch: %+v", cfg.General)
+	}
+	if cfg.General.Cacert != "/etc/wstgo/ca-root.crt" {
+		t.Fatalf("cacert should parse: %+v", cfg.General)
 	}
 	if len(cfg.Client) != 2 {
 		t.Fatalf("want 2 client forwards, got %d", len(cfg.Client))

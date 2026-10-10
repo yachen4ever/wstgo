@@ -14,7 +14,8 @@ ExecStart=/usr/local/bin/wstgo run -config /etc/wstgo/wstgo-client.toml
 #     -bind 127.0.0.1:25432 \
 #     -url wss://tunnel.example.com/ws \
 #     -key /etc/wstgo/client/private.pem
-# 自签名 wss 场景追加: -insecure（配置文件模式对应 allow_insecure = true）
+# 自签名 wss 场景推荐追加: -cacert /etc/wstgo/ca-root.crt（配置文件模式对应 cacert 字段）
+# 临时调试才用 -insecure（配置文件模式对应 allow_insecure = true，与 cacert 互斥）
 
 # 配置、私钥等文件建议放 /etc/wstgo 下，与下方 ProtectSystem=strict 兼容（仍可读）
 Restart=always

@@ -16,7 +16,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "  wstgo genkey  -dir <dir>")
 	fmt.Fprintln(os.Stderr, "  wstgo server  -bind <addr> -target <addr> -authdir <dir> [-tlscert <crt> -tlskey <key>] [-v]")
-	fmt.Fprintln(os.Stderr, "  wstgo client  -bind <addr> -url <(ws|wss)://...> -key <private.pem> [-v] [-insecure]")
+	fmt.Fprintln(os.Stderr, "  wstgo client  -bind <addr> -url <(ws|wss)://...> -key <private.pem> [-cacert <ca.crt>] [-v] [-insecure]")
 	fmt.Fprintln(os.Stderr, "  wstgo run     -config <wstgo.toml> [-v]   (multi-port forwarding)")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Subcommands:")
@@ -85,14 +85,15 @@ func main() {
 		url := fs.String("url", "", "websocket URL of server (e.g. ws://host:8888/ws)")
 		keyPath := fs.String("key", "./private.pem", "client private key file")
 		v := fs.Bool("v", false, "verbose: log per-byte traffic direction (L→R/R→L)")
-		insecure := fs.Bool("insecure", false, "skip TLS certificate verification (for wss:// with self-signed certs)")
+		insecure := fs.Bool("insecure", false, "skip TLS certificate verification (temporary debugging only; MITM-prone, prefer -cacert)")
+		caCert := fs.String("cacert", "", "CA certificate file (PEM/DER) to verify the server's wss:// certificate (self-signed CA scenario)")
 		_ = fs.Parse(os.Args[2:])
 		verbose = *v
 		if *url == "" {
 			fmt.Fprintln(os.Stderr, "client: -url is required")
 			os.Exit(2)
 		}
-		client(*bind, *url, *keyPath, *insecure)
+		client(*bind, *url, *keyPath, *insecure, *caCert)
 
 	case "run", "-config", "--config":
 		// run -config <file>；裸 -config <file> 为等价简写

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -30,11 +31,35 @@ var (
 	dialTimeout      = 10 * time.Second
 )
 
+// loadCACertPool 读取 CA 证书文件，构建用于校验服务端证书的信任池。
+// 支持 PEM（可含多张证书，根 + 中间链）与 DER（Windows 分发的 .crt 常为
+// DER）两种编码。注意标准 X.509 语义：证书链与主机名/SAN 都会校验，
+// 直连 IP 时叶子证书的 SAN 需包含该 IP。
+func loadCACertPool(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if pool.AppendCertsFromPEM(data) {
+		return pool, nil
+	}
+	if cert, derErr := x509.ParseCertificate(data); derErr == nil {
+		pool.AddCert(cert)
+		return pool, nil
+	}
+	return nil, fmt.Errorf("no certificate found in %s (neither PEM nor DER)", path)
+}
+
 // dialWithRetry 带指数退避地拨号 WS 并完成鉴权握手。
 // 成功返回已通过鉴权的 WS 连接；失败返回最后一次错误。
-// insecure=true 时跳过 TLS 证书验证（用于 wss:// + 自签名证书场景）。
-// 404 视为配置错误（标签在服务端不存在），不重试。
-func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool) (*websocket.Conn, error) {
+// 服务端身份校验三选一（由调用方保证互斥）：
+//   - insecure=true：跳过 TLS 证书校验（仅临时调试，有主动中间人风险）
+//   - caPool != nil：用指定 CA 做标准链 + 主机名校验（自签 CA 场景推荐）
+//   - 都为零值：系统信任库（CA 签发的公共证书场景）
+//
+// 404 与证书校验失败视为配置错误，不重试。
+func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool, caPool *x509.CertPool) (*websocket.Conn, error) {
 	var lastErr error
 	backoff := dialRetryInitial
 	for attempt := 1; attempt <= dialRetryMaxNum; attempt++ {
@@ -43,6 +68,8 @@ func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool) 
 		}
 		if insecure {
 			d.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		} else if caPool != nil {
+			d.TLSClientConfig = &tls.Config{RootCAs: caPool}
 		}
 		ws, resp, err := d.Dial(websocketURL, nil)
 		if err == nil {
@@ -57,6 +84,14 @@ func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool) 
 		}
 		if errors.Is(err, websocket.ErrBadHandshake) && resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("dial %s: 404 not found (no [server.*] forward with this label on the server?)", websocketURL)
+		}
+		// 证书校验失败（CA 不信任 / 主机名不匹配 / 证书过期）是配置错误，
+		// 重试也不会好，立即失败——与 404 同等对待。
+		var unknownAuth x509.UnknownAuthorityError
+		var hostname x509.HostnameError
+		var invalid x509.CertificateInvalidError
+		if errors.As(err, &unknownAuth) || errors.As(err, &hostname) || errors.As(err, &invalid) {
+			return nil, fmt.Errorf("dial %s: server certificate rejected: %v", websocketURL, err)
 		}
 		lastErr = err
 		log.Printf("dial attempt %d/%d failed: %v", attempt, dialRetryMaxNum, err)
@@ -94,10 +129,10 @@ func startHeartbeat(ws *websocket.Conn, writeMu *sync.Mutex, ctx context.Context
 
 // handleLocalConn 处理单个本地 TCP 连接：
 // 拨 WS + 鉴权 + 心跳 + 双向桥接。label 为配置模式的转发标签（CLI 模式为空）。
-func handleLocalConn(tcp net.Conn, websocketURL string, priv ed25519.PrivateKey, insecure bool, label string) {
+func handleLocalConn(tcp net.Conn, websocketURL string, priv ed25519.PrivateKey, insecure bool, caPool *x509.CertPool, label string) {
 	defer tcp.Close()
 
-	ws, err := dialWithRetry(websocketURL, priv, insecure)
+	ws, err := dialWithRetry(websocketURL, priv, insecure, caPool)
 	if err != nil {
 		log.Printf("establish tunnel failed%s: %v", labelSuffix(label), err)
 		return
@@ -169,7 +204,19 @@ func bridgeClient(ws *websocket.Conn, tcp net.Conn, writeMu *sync.Mutex, ctx con
 	}
 }
 
-func client(bindAddr, websocketURL, keyPath string, insecure bool) {
+func client(bindAddr, websocketURL, keyPath string, insecure bool, caCertPath string) {
+	if insecure && caCertPath != "" {
+		log.Fatal("client: -insecure and -cacert are mutually exclusive (pick one way to trust the server)")
+	}
+	var caPool *x509.CertPool
+	if caCertPath != "" {
+		var err error
+		if caPool, err = loadCACertPool(caCertPath); err != nil {
+			log.Fatalf("load CA cert %s: %v", caCertPath, err)
+		}
+		log.Printf("server verification: CA cert %s", caCertPath)
+	}
+
 	priv, err := loadPrivateKey(keyPath)
 	if err != nil {
 		log.Fatalf("load private key %s: %v", keyPath, err)
@@ -188,7 +235,7 @@ func client(bindAddr, websocketURL, keyPath string, insecure bool) {
 			log.Printf("accept: %v", err)
 			return
 		}
-		go handleLocalConn(tcp, websocketURL, priv, insecure, "")
+		go handleLocalConn(tcp, websocketURL, priv, insecure, caPool, "")
 	}
 }
 
@@ -196,6 +243,18 @@ func client(bindAddr, websocketURL, keyPath string, insecure bool) {
 // 在本地起一个 TCP 监听，转发到服务端 <general.url>/<label> 对应的路径。
 // 全部端口先绑定再服务（任一失败整体退出）；SIGINT/SIGTERM 时关闭监听退出。
 func runClientConfig(cfg *Config) {
+	if cfg.General.AllowInsecure && cfg.General.Cacert != "" {
+		log.Fatal("config: general.allow_insecure and general.cacert are mutually exclusive")
+	}
+	var caPool *x509.CertPool
+	if cfg.General.Cacert != "" {
+		var err error
+		if caPool, err = loadCACertPool(cfg.General.Cacert); err != nil {
+			log.Fatalf("load CA cert %s: %v", cfg.General.Cacert, err)
+		}
+		log.Printf("server verification: CA cert %s", cfg.General.Cacert)
+	}
+
 	priv, err := loadPrivateKey(cfg.General.Key)
 	if err != nil {
 		log.Fatalf("load private key %s: %v", cfg.General.Key, err)
@@ -230,7 +289,7 @@ func runClientConfig(cfg *Config) {
 					}
 					return
 				}
-				go handleLocalConn(tcp, url, priv, cfg.General.AllowInsecure, name)
+				go handleLocalConn(tcp, url, priv, cfg.General.AllowInsecure, caPool, name)
 			}
 		}()
 	}
