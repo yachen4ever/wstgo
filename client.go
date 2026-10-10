@@ -22,10 +22,11 @@ import (
 )
 
 // 重连参数：每个本地 TCP 连接独立拨 WS，失败时退避重试。
-const (
+// var 是为了测试可注入更短的退避参数。
+var (
 	dialRetryInitial = 1 * time.Second
 	dialRetryMax     = 30 * time.Second
-	dialRetryMaxNum  = 5 // 1+2+4+8+16 = 31s 上限
+	dialRetryMaxNum  = 5 // 最多尝试 5 次，中间退避 1+2+4+8 = 15s（第 5 次失败后不再等待）
 	dialTimeout      = 10 * time.Second
 )
 

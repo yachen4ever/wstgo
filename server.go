@@ -109,8 +109,21 @@ func runServerConfig(cfg *Config) {
 			"  fix: run `wstgo genkey` on each CLIENT, then copy its public.pem into this dir (any filename works)", cfg.General.AuthDir)
 	}
 	log.Printf("loaded %d authorized public key(s) from %s", n, cfg.General.AuthDir)
+	wl.startReloadLoop()
 
-	forwards := cfg.Server
+	mux := buildServerMux(wl, cfg.Server)
+
+	log.Printf("wstgo server listening on %s, %d forward(s):", cfg.General.Bind, len(cfg.Server))
+	for _, name := range slices.Sorted(maps.Keys(cfg.Server)) {
+		f := cfg.Server[name]
+		log.Printf("  /ws/%s -> %s (type=%s)", name, f.Target, typeNameOrGeneric(f.Type))
+	}
+	log.Fatal(http.ListenAndServe(cfg.General.Bind, mux))
+}
+
+// buildServerMux 构建配置模式服务端路由：/ws/<label> 升级为 WS 并转发到
+// 对应 target；裸 /ws 与未知标签显式 404。
+func buildServerMux(wl *publicKeyWhitelist, forwards map[string]ServerForward) *http.ServeMux {
 	mux := http.NewServeMux()
 	// 裸 /ws 在配置模式下没有对应转发，显式 404（避免 ServeMux 307 重定向）。
 	// 客户端连 <url>/<label>，漏掉标签时会在这里得到明确提示。
@@ -137,13 +150,7 @@ func runServerConfig(cfg *Config) {
 		}
 		serveTunnel(ws, wl, fwd.Target, name, r.RemoteAddr)
 	})
-
-	log.Printf("wstgo server listening on %s, %d forward(s):", cfg.General.Bind, len(forwards))
-	for _, name := range slices.Sorted(maps.Keys(forwards)) {
-		f := forwards[name]
-		log.Printf("  /ws/%s -> %s (type=%s)", name, f.Target, typeNameOrGeneric(f.Type))
-	}
-	log.Fatal(http.ListenAndServe(cfg.General.Bind, mux))
+	return mux
 }
 
 // installHeartbeat 为 WS 连接安装心跳处理：
@@ -252,6 +259,7 @@ func server(bindAddr, destAddr, authDir, tlsCert, tlsKey string) {
 			"  fix: run `wstgo genkey` on each CLIENT, then copy its public.pem into this dir (any filename works)", authDir)
 	}
 	log.Printf("loaded %d authorized public key(s) from %s", n, authDir)
+	wl.startReloadLoop()
 
 	s := &Server{
 		DestAddress: destAddr,

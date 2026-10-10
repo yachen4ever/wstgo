@@ -26,8 +26,10 @@ const (
 	lenNonceMsg  = 1 + nonceSize
 	lenAuthMsg   = 1 + ed25519.PublicKeySize + sigSize
 	lenAuthOKMsg = 1
-	authDeadline = 10 * time.Second // 握手超时，防慢速攻击
 )
+
+// authDeadline 握手超时，防慢速认证攻击。var 是为了测试可注入短超时。
+var authDeadline = 10 * time.Second
 
 // authError 表示握手失败的具体原因，方便 server 端打日志。
 type authError struct {
@@ -45,6 +47,11 @@ func (e *authError) Error() string { return e.reason }
 //  3. 校验公钥在白名单 + ed25519.Verify(pubkey, nonce, signature)
 //  4. 发 OK，进入数据模式
 func serverHandshake(ws *websocket.Conn, whitelist *publicKeyWhitelist) (ed25519.PublicKey, error) {
+	if whitelist != nil && whitelist.count() == 0 {
+		// 白名单可能在运行期被清空（先清空再拷入新公钥的轮换方式、全部吊销）：
+		// 触发一次限流重扫，让补进来的公钥对下一条连接生效，而不是干等周期重扫。
+		whitelist.rescan(true)
+	}
 	if whitelist == nil || whitelist.count() == 0 {
 		return nil, &authError{reason: "no authorized public keys configured on server"}
 	}
@@ -77,9 +84,13 @@ func serverHandshake(ws *websocket.Conn, whitelist *publicKeyWhitelist) (ed25519
 	pub := ed25519.PublicKey(buf[1 : 1+ed25519.PublicKeySize])
 	sig := buf[1+ed25519.PublicKeySize:]
 
-	// 3. 白名单 + 验签
+	// 3. 白名单 + 验签。未命中先触发一次限流重扫：新放进 authdir 的
+	// 公钥无需重启即可用于下一条连接。
 	if !whitelist.contains(pub) {
-		return pub, &authError{reason: "public key not in whitelist"}
+		whitelist.rescan(true)
+		if !whitelist.contains(pub) {
+			return pub, &authError{reason: "public key not in whitelist"}
+		}
 	}
 	if !ed25519.Verify(pub, nonce[:], sig) {
 		return pub, &authError{reason: "signature verification failed"}
@@ -115,10 +126,21 @@ func clientHandshake(ws *websocket.Conn, priv ed25519.PrivateKey) error {
 	}
 	defer ws.SetReadDeadline(time.Time{})
 
-	// 1. 收 nonce
+	// 1. 收 nonce。服务端在发 nonce 之前就可能拒绝（如白名单为空），
+	// 此时首帧是 [0x04]，把真实原因透传给调用方而不是报"格式错误"。
 	_, buf, err := ws.ReadMessage()
 	if err != nil {
 		return fmt.Errorf("read nonce: %w", err)
+	}
+	if len(buf) < 1 {
+		return &authError{reason: "empty nonce message"}
+	}
+	if buf[0] == msgAuthFail {
+		reason := "rejected"
+		if len(buf) > 1 {
+			reason = string(buf[1:])
+		}
+		return &authError{reason: reason}
 	}
 	if len(buf) != lenNonceMsg || buf[0] != msgNonce {
 		return &authError{reason: "malformed nonce message"}
