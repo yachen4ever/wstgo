@@ -62,6 +62,9 @@ func (c *Config) validate() error {
 		if len(c.Client) > 0 {
 			log.Printf("config: ignoring [client] section (run_mode=server)")
 		}
+		if c.General.URL != "" || c.General.Key != "" || c.General.AllowInsecure || c.General.Cacert != "" {
+			log.Printf("config: ignoring client-only field(s) in [general]: url/key/allow_insecure/cacert")
+		}
 		if c.General.Bind == "" {
 			return errors.New(`config: general.bind is required ("host:port")`)
 		}
@@ -86,11 +89,18 @@ func (c *Config) validate() error {
 		if len(c.Server) > 0 {
 			log.Printf("config: ignoring [server] section (run_mode=client)")
 		}
+		if c.General.Bind != "" || c.General.AuthDir != "" {
+			log.Printf("config: ignoring server-only field(s) in [general]: bind/auth_dir")
+		}
 		if c.General.URL == "" {
 			return errors.New("config: general.url is required")
 		}
 		if !strings.HasPrefix(c.General.URL, "ws://") && !strings.HasPrefix(c.General.URL, "wss://") {
 			return errors.New(`config: general.url must start with "ws://" or "wss://"`)
+		}
+		// query 串会让标签拼进 query（<url>/<标签> 的拼接语义），必然 404，直接拒绝
+		if strings.Contains(c.General.URL, "?") {
+			return errors.New(`config: general.url must not contain a query string`)
 		}
 		if c.General.Key == "" {
 			return errors.New("config: general.key is required")

@@ -344,3 +344,56 @@ func TestRunArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestURLQueryRejected(t *testing.T) {
+	// query 串会让标签拼进 query 必然 404，配置校验直接拒绝
+	_, err := loadConfig(writeTempConfig(t, `
+[general]
+run_mode = "client"
+url = "ws://tunnel.example.com/ws?x=1"
+key = "/tmp/private.pem"
+[client.ssh1]
+bind = "127.0.0.1:50022"
+`))
+	if err == nil || !strings.Contains(err.Error(), "query string") {
+		t.Fatalf("url with query should be rejected, got %v", err)
+	}
+}
+
+func TestCrossModeFieldWarnings(t *testing.T) {
+	// server 模式混入 client 专属字段 / client 模式混入 server 专属字段：
+	// 加载成功（告警忽略），不报错
+	cfg, err := loadConfig(writeTempConfig(t, `
+[general]
+run_mode = "server"
+bind = "127.0.0.1:8888"
+auth_dir = "/tmp/k"
+url = "ws://should-be-ignored"
+key = "/tmp/also-ignored"
+[server.ssh1]
+target = "127.0.0.1:22"
+`))
+	if err != nil {
+		t.Fatalf("cross-mode fields should only warn: %v", err)
+	}
+	if cfg.General.RunMode != "server" {
+		t.Fatal("run_mode mismatch")
+	}
+
+	cfg, err = loadConfig(writeTempConfig(t, `
+[general]
+run_mode = "client"
+url = "ws://tunnel.example.com/ws"
+key = "/tmp/private.pem"
+bind = "127.0.0.1:8888"
+auth_dir = "/tmp/also-ignored"
+[client.ssh1]
+bind = "127.0.0.1:50022"
+`))
+	if err != nil {
+		t.Fatalf("cross-mode fields should only warn: %v", err)
+	}
+	if cfg.General.RunMode != "client" {
+		t.Fatal("run_mode mismatch")
+	}
+}
