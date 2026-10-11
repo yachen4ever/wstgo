@@ -78,9 +78,13 @@ func TestGenerateKeyPairFilesAndPerms(t *testing.T) {
 			t.Errorf("%s perm = %v, want %v", tc.name, info.Mode().Perm(), tc.perm)
 		}
 	}
-	// 重复生成（覆盖已有文件）不应报错
-	if _, _, err := generateKeyPair(dir); err != nil {
-		t.Fatalf("regenerate into existing dir: %v", err)
+	// 重复生成应被拒绝：防止误覆盖服务端白名单仍在引用的旧密钥
+	if _, _, err := generateKeyPair(dir); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("regenerating into existing dir should be refused, got %v", err)
+	}
+	// 换新目录不受影响
+	if _, _, err := generateKeyPair(filepath.Join(dir, "fresh")); err != nil {
+		t.Fatalf("fresh dir should work: %v", err)
 	}
 }
 

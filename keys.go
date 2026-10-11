@@ -22,10 +22,20 @@ const (
 )
 
 // generateKeyPair 生成一对 ed25519 密钥，并以 PEM 格式写入 dir。
-// 返回私钥/公钥文件路径。
+// 返回私钥/公钥文件路径。目录下已存在密钥文件时拒绝执行——误对在用目录
+// 跑 genkey 会不可逆地销毁服务端白名单仍在引用的旧密钥。
 func generateKeyPair(dir string) (privPath, pubPath string, err error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", fmt.Errorf("create key dir: %w", err)
+	}
+	privPath = filepath.Join(dir, privKeyFile)
+	pubPath = filepath.Join(dir, pubKeyFile)
+	for _, p := range []string{privPath, pubPath} {
+		if _, err := os.Stat(p); err == nil {
+			return "", "", fmt.Errorf("%s already exists; refusing to overwrite (delete it first or use another -dir)", p)
+		} else if !os.IsNotExist(err) {
+			return "", "", fmt.Errorf("stat %s: %w", p, err)
+		}
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -41,8 +51,6 @@ func generateKeyPair(dir string) (privPath, pubPath string, err error) {
 		return "", "", fmt.Errorf("marshal public key: %w", err)
 	}
 
-	privPath = filepath.Join(dir, privKeyFile)
-	pubPath = filepath.Join(dir, pubKeyFile)
 	if err := writePEM(privPath, "PRIVATE KEY", privDER, 0o600); err != nil {
 		return "", "", err
 	}
