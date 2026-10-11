@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -60,13 +61,28 @@ func generateKeyPair(dir string) (privPath, pubPath string, err error) {
 	return privPath, pubPath, nil
 }
 
+// writePEM 以 PEM 格式写证书/密钥文件：先写同目录临时文件再 rename，
+// 中途失败不会留下半截密钥文件。
 func writePEM(path, typ string, der []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
+		return fmt.Errorf("create %s: %w", tmp, err)
 	}
-	defer f.Close()
-	return pem.Encode(f, &pem.Block{Type: typ, Bytes: der})
+	if err := pem.Encode(f, &pem.Block{Type: typ, Bytes: der}); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("encode %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename %s: %w", tmp, err)
+	}
+	return nil
 }
 
 // loadPrivateKey 从 PEM 文件加载 ed25519 私钥。
@@ -115,12 +131,15 @@ func loadPublicKey(path string) (ed25519.PublicKey, error) {
 }
 
 // publicKeyFingerprint 返回公钥的简短指纹，用于日志/审计。
-// 形如: ed25519:A1B2C3D4 (公钥前 4 字节的 hex)。
+// 形如 ed25519:1a2b3c4d5e（SHA-256 前 5 字节的 hex）。取 SHA-256 而非公钥
+// 原始字节前缀：4 字节前缀可被离线批量生成碰撞，审计日志可被伪造混淆；
+// 40bit 的哈希截断让伪造需要 2^40 量级的工作量。
 func publicKeyFingerprint(pub ed25519.PublicKey) string {
-	if len(pub) < 4 {
+	if len(pub) != ed25519.PublicKeySize {
 		return "ed25519:?"
 	}
-	return fmt.Sprintf("ed25519:%02X%02X%02X%02X", pub[0], pub[1], pub[2], pub[3])
+	sum := sha256.Sum256(pub)
+	return fmt.Sprintf("ed25519:%x", sum[:5])
 }
 
 // 白名单热加载：启动加载一次之后，服务端还有两个重扫 authdir 的时机——

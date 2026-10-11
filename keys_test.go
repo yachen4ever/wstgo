@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"os"
@@ -121,11 +123,46 @@ func TestLoadPrivateKeyErrors(t *testing.T) {
 func TestPublicKeyFingerprint(t *testing.T) {
 	_, pub := genTestKeyPair(t, t.TempDir())
 	fp := publicKeyFingerprint(pub)
-	if !strings.HasPrefix(fp, "ed25519:") || len(fp) != len("ed25519:")+8 {
+	if !strings.HasPrefix(fp, "ed25519:") || len(fp) != len("ed25519:")+10 {
 		t.Fatalf("fingerprint format unexpected: %q", fp)
+	}
+	// 确定性：同一把公钥指纹稳定，不同公钥指纹不同
+	if fp != publicKeyFingerprint(pub) {
+		t.Fatal("fingerprint should be deterministic")
+	}
+	_, pub2 := genTestKeyPair(t, t.TempDir())
+	if fp == publicKeyFingerprint(pub2) {
+		t.Fatal("different keys must have different fingerprints")
 	}
 	if got := publicKeyFingerprint(ed25519.PublicKey("ab")); got != "ed25519:?" {
 		t.Fatalf("short key fingerprint = %q, want ed25519:?", got)
+	}
+}
+
+func TestKeyTypeErrorRejected(t *testing.T) {
+	// RSA 密钥混入：loadPrivateKey/loadPublicKey 必须明确拒绝
+	dir := t.TempDir()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privDER, _ := x509.MarshalPKCS8PrivateKey(key)
+	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+
+	privPath := filepath.Join(dir, "rsa-private.pem")
+	var buf bytes.Buffer
+	pem.Encode(&buf, &pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+	os.WriteFile(privPath, buf.Bytes(), 0o600)
+	if _, err := loadPrivateKey(privPath); err == nil || !strings.Contains(err.Error(), "not an ed25519") {
+		t.Fatalf("RSA private key should be rejected, got %v", err)
+	}
+
+	pubPath := filepath.Join(dir, "rsa-public.pem")
+	buf.Reset()
+	pem.Encode(&buf, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
+	os.WriteFile(pubPath, buf.Bytes(), 0o600)
+	if _, err := loadPublicKey(pubPath); err == nil || !strings.Contains(err.Error(), "not an ed25519") {
+		t.Fatalf("RSA public key should be rejected, got %v", err)
 	}
 }
 
