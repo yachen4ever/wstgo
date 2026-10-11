@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -107,18 +106,18 @@ func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool, 
 }
 
 // startHeartbeat 在已鉴权的 WS 上定期发 Ping。
-// 通过 ctx 退出。
-func startHeartbeat(ws *websocket.Conn, writeMu *sync.Mutex, ctx context.Context) {
-	ticker := time.NewTicker(heartbeatInterval)
+// 通过 ctx 退出；Ping 写失败视为连接已死，立即 cancel 触发双向拆除。
+// WriteControl 按 gorilla 语义可与数据写并发，无需与 bridge 共享锁。
+func startHeartbeat(ws *websocket.Conn, ctx context.Context, cancel context.CancelFunc) {
+	ticker := time.NewTicker(time.Duration(heartbeatInterval.Load()))
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			writeMu.Lock()
-			err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait))
-			writeMu.Unlock()
+			err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Duration(writeWait.Load())))
 			if err != nil {
 				log.Printf("heartbeat ping failed: %v", err)
+				cancel()
 				return
 			}
 		case <-ctx.Done():
@@ -143,65 +142,11 @@ func handleLocalConn(tcp net.Conn, websocketURL string, priv ed25519.PrivateKey,
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	var writeMu sync.Mutex
-	go startHeartbeat(ws, &writeMu, ctx)
+	go startHeartbeat(ws, ctx, cancel)
 
 	log.Printf("client tunnel up%s: %s <-> %s", labelSuffix(label), tcp.RemoteAddr(), websocketURL)
-	bridgeClient(ws, tcp, &writeMu, ctx, labelSuffix(label))
+	bridge(ws, tcp, ctx, cancel, false, labelSuffix(label))
 	log.Printf("client tunnel down%s: %s", labelSuffix(label), tcp.RemoteAddr())
-}
-
-// bridgeClient 是 client 侧的桥接，与 server 端 bridge 对称。
-// 共享 writeMu 以串行化数据写与心跳 Ping 写。tag 为日志后缀。
-func bridgeClient(ws *websocket.Conn, tcp net.Conn, writeMu *sync.Mutex, ctx context.Context, tag string) {
-	dir1, dir2 := "L\u2192R", "R\u2192L"
-
-	// 协程: TCP -> WS
-	go func() {
-		buf := make([]byte, ioBufSize)
-		for {
-			n, err := tcp.Read(buf)
-			if n > 0 {
-				writeMu.Lock()
-				werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-				writeMu.Unlock()
-				if werr != nil {
-					log.Printf("%s%s write err: %v", dir1, tag, werr)
-					tcp.Close()
-					return
-				}
-				if verbose {
-					log.Printf("%s%s %d", dir1, tag, n)
-				}
-			}
-			if err != nil {
-				tcp.Close()
-				return
-			}
-		}
-	}()
-
-	// 主: WS -> TCP
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		_, buf, err := ws.ReadMessage()
-		if err != nil {
-			log.Printf("%s%s read err: %v", dir2, tag, err)
-			return
-		}
-		if _, err := tcp.Write(buf); err != nil {
-			log.Printf("%s%s write err: %v", dir2, tag, err)
-			return
-		}
-		if verbose {
-			log.Printf("%s%s %d", dir2, tag, len(buf))
-		}
-	}
 }
 
 func client(bindAddr, websocketURL, keyPath string, insecure bool, caCertPath string) {
@@ -232,6 +177,16 @@ func client(bindAddr, websocketURL, keyPath string, insecure bool, caCertPath st
 	for {
 		tcp, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Temporary() {
+				// EMFILE/ENFILE 等瞬时错误：退避重试，不能让整个客户端退出
+				log.Printf("accept: %v (transient, retrying)", err)
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
 			log.Printf("accept: %v", err)
 			return
 		}
@@ -284,6 +239,16 @@ func runClientConfig(cfg *Config) {
 			for {
 				tcp, err := ln.Accept()
 				if err != nil {
+					if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+						return
+					}
+					var ne net.Error
+					if errors.As(err, &ne) && ne.Temporary() {
+						// 瞬时错误退避重试，避免 FD 压力下某条 forward 静默失联
+						log.Printf("accept (%s): %v (transient, retrying)", name, err)
+						time.Sleep(5 * time.Millisecond)
+						continue
+					}
 					if ctx.Err() == nil {
 						log.Printf("accept (%s): %v", name, err)
 					}

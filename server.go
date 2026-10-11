@@ -9,11 +9,34 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// 传输参数。用 atomic 是因为测试会注入更短值，而连接协程与测试清理之间
+// 没有同步点——普通全局变量会被 race detector 判定为数据竞争。
+var (
+	heartbeatInterval atomic.Int64 // client 发 Ping 的间隔（默认 10s）
+	readTimeout       atomic.Int64 // 任意方向无消息即断开（默认 30s）；DB 场景宁可快速失败让应用重连
+	writeWait         atomic.Int64 // 单次 WS 写（数据/控制帧）的超时（默认 10s），防慢消费对端把数据写无限期阻塞
+	targetDialTimeout atomic.Int64 // 拨号 -target 的超时（默认 5s）；net.Dial 默认无超时，会挂到 OS 级 TCP 超时
+)
+
+const (
+	defaultHeartbeatInterval = 10 * time.Second
+	defaultReadTimeout       = 30 * time.Second
+	defaultWriteWait         = 10 * time.Second
+	defaultTargetDialTimeout = 5 * time.Second
+)
+
+func init() {
+	heartbeatInterval.Store(int64(defaultHeartbeatInterval))
+	readTimeout.Store(int64(defaultReadTimeout))
+	writeWait.Store(int64(defaultWriteWait))
+	targetDialTimeout.Store(int64(defaultTargetDialTimeout))
+}
 
 const (
 	// ioBufSize 同时用作 TCP 读缓冲和 WS 单帧上限：大结果集/COPY 场景下
@@ -21,11 +44,7 @@ const (
 	ioBufSize = 32 * 1024
 	// maxMessageSize 须大于对端单帧上限（ioBufSize），防止未鉴权对端
 	// 发送超大帧触发无界内存分配。调整 ioBufSize 时需同步调整。
-	maxMessageSize    = 64 * 1024
-	heartbeatInterval = 10 * time.Second // client 发 Ping 的间隔
-	readTimeout       = 30 * time.Second // 任意方向无消息即断开（含心跳）；DB 场景宁可快速失败让应用重连
-	writeWait         = 10 * time.Second // 单次 WriteControl 的超时
-	targetDialTimeout = 5 * time.Second  // 拨号 -target 的超时；net.Dial 默认无超时，会挂到 OS 级 TCP 超时
+	maxMessageSize = 64 * 1024
 )
 
 var upgrader = websocket.Upgrader{
@@ -81,7 +100,7 @@ func serveTunnel(ws *websocket.Conn, wl *publicKeyWhitelist, target, label, remo
 		remoteAddr, target, labelSuffix(label), publicKeyFingerprint(pub))
 
 	// 2. 拨号目标 TCP
-	tcp, err := (&net.Dialer{Timeout: targetDialTimeout}).Dial("tcp", target)
+	tcp, err := (&net.Dialer{Timeout: time.Duration(targetDialTimeout.Load())}).Dial("tcp", target)
 	if err != nil {
 		log.Printf("dial target %s: %v", target, err)
 		return
@@ -92,7 +111,9 @@ func serveTunnel(ws *websocket.Conn, wl *publicKeyWhitelist, target, label, remo
 	installHeartbeat(ws)
 
 	// 4. 双向桥接
-	bridge(ws, tcp, true, labelSuffix(label)) // true: server 端，关闭时主动断 TCP
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridge(ws, tcp, ctx, cancel, true, labelSuffix(label))
 	log.Printf("tunnel closed: %s <-> %s%s (client=%s)",
 		remoteAddr, target, labelSuffix(label), publicKeyFingerprint(pub))
 }
@@ -118,7 +139,14 @@ func runServerConfig(cfg *Config) {
 		f := cfg.Server[name]
 		log.Printf("  /ws/%s -> %s (type=%s)", name, f.Target, typeNameOrGeneric(f.Type))
 	}
-	log.Fatal(http.ListenAndServe(cfg.General.Bind, mux))
+	// 同 server()：显式超时防 slowloris；hijack 后 deadline 归 wstgo 管
+	srv := &http.Server{
+		Addr:              cfg.General.Bind,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 // buildServerMux 构建配置模式服务端路由：/ws/<label> 升级为 WS 并转发到
@@ -159,45 +187,56 @@ func buildServerMux(wl *publicKeyWhitelist, forwards map[string]ServerForward) *
 //   - 收到 Pong 续约
 //   - 数据模式期间任何 ReadMessage 出错即退出
 func installHeartbeat(ws *websocket.Conn) {
-	_ = ws.SetReadDeadline(time.Now().Add(readTimeout))
+	_ = ws.SetReadDeadline(time.Now().Add(time.Duration(readTimeout.Load())))
 	ws.SetPingHandler(func(appData string) error {
-		_ = ws.SetReadDeadline(time.Now().Add(readTimeout))
-		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
+		_ = ws.SetReadDeadline(time.Now().Add(time.Duration(readTimeout.Load())))
+		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Duration(writeWait.Load())))
 	})
 	ws.SetPongHandler(func(string) error {
-		_ = ws.SetReadDeadline(time.Now().Add(readTimeout))
+		_ = ws.SetReadDeadline(time.Now().Add(time.Duration(readTimeout.Load())))
 		return nil
 	})
 }
 
-// bridge 在 WS 与 TCP 之间双向转发数据。
-// 鉴权已完成，所有 BinaryMessage 的 payload 即为 TCP 字节。
-// tag 为日志后缀（如 " [pg1]"，CLI 模式为空串）。任一方向出错即关闭两端。
-func bridge(ws *websocket.Conn, tcp net.Conn, serverSide bool, tag string) {
-	ctx, cancel := context.WithCancel(context.Background())
+// bridge 在 WS 与 TCP 之间双向转发数据。鉴权已完成，所有 BinaryMessage
+// 的 payload 即 TCP 字节。serverSide 决定日志方向（C→S/S→C 或 L→R/R→L）
+// 与 TCP 读错误的静默策略——client 侧本地断开属正常行为，静默。
+// 服务端与客户端共用这一份实现（此前各自维护，退出语义已经漂移过一次）。
+//
+// 生命周期不变量：任何一条退出路径都必须同时关闭 ws 与 tcp 并 cancel。
+// 单纯 cancel 唤不醒阻塞中的 ReadMessage/tcp.Read，而心跳会持续续约读超时，
+// 所以单侧关闭若不显式通知对端，整条隧道（含 server 端的 target 连接）
+// 会被永久焊住。关 tcp 唤醒对端方向的 tcp.Read，关 ws 唤醒本端的
+// ReadMessage 并让对端立即感知断开。
+func bridge(ws *websocket.Conn, tcp net.Conn, ctx context.Context, cancel context.CancelFunc, serverSide bool, tag string) {
 	defer cancel()
 
-	// 标签日志：server 端记 C→S/S→C，client 端记 L→R/R→L（Local/Remote）
-	dir1, dir2 := "C\u2192S", "S\u2192C"
+	dir1, dir2 := "C\u2192S", "S\u2192C" // TCP→WS / WS→TCP 方向的日志前缀
+	logTCPErr := serverSide
 	if !serverSide {
 		dir1, dir2 = "L\u2192R", "R\u2192L"
+		logTCPErr = false
 	}
 
-	var writeMu sync.Mutex // 串行化 ws 写（数据 + 控制帧）
+	teardown := func() {
+		cancel()
+		tcp.Close()
+		ws.Close()
+	}
 
-	// 协程 1: TCP -> WS
+	// 协程: TCP -> WS
 	go func() {
 		buf := make([]byte, ioBufSize)
 		for {
 			n, err := tcp.Read(buf)
 			if n > 0 {
-				writeMu.Lock()
+				// 数据写限时：对端停止消费时 TCP 窗口填满、写会无限期阻塞，
+				// 而心跳只证明传输层活着，不证明数据通路在排空。
+				_ = ws.SetWriteDeadline(time.Now().Add(time.Duration(writeWait.Load())))
 				werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-				writeMu.Unlock()
 				if werr != nil {
 					log.Printf("%s%s write err: %v", dir1, tag, werr)
-					cancel()
-					tcp.Close()
+					teardown()
 					return
 				}
 				if verbose {
@@ -205,11 +244,10 @@ func bridge(ws *websocket.Conn, tcp net.Conn, serverSide bool, tag string) {
 				}
 			}
 			if err != nil {
-				if err != io.EOF {
+				if logTCPErr && err != io.EOF {
 					log.Printf("%s%s read err: %v", dir1, tag, err)
 				}
-				cancel()
-				tcp.Close()
+				teardown()
 				return
 			}
 		}
@@ -219,23 +257,24 @@ func bridge(ws *websocket.Conn, tcp net.Conn, serverSide bool, tag string) {
 	for {
 		select {
 		case <-ctx.Done():
-			ws.Close()
+			teardown()
 			return
 		default:
 		}
 		_, buf, err := ws.ReadMessage()
 		if err != nil {
-			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+			if serverSide || !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Printf("%s%s read err: %v", dir2, tag, err)
 			}
-			cancel()
-			ws.Close()
+			teardown()
 			return
 		}
+		// TCP 写同样限时（对端 app 停止消费会填满接收窗口），上限与
+		// 读超时同源：任何方向停滞超过 30s 即视为死链。
+		_ = tcp.SetWriteDeadline(time.Now().Add(time.Duration(readTimeout.Load())))
 		if _, err := tcp.Write(buf); err != nil {
 			log.Printf("%s%s write err: %v", dir2, tag, err)
-			cancel()
-			ws.Close()
+			teardown()
 			return
 		}
 		if verbose {
@@ -266,10 +305,18 @@ func server(bindAddr, destAddr, authDir, tlsCert, tlsKey string) {
 		Whitelist:   wl,
 	}
 	http.HandleFunc("/ws", s.handler)
+	// 显式超时防未认证 slowloris 占满连接（头部超时与握手超时同源 10s）。
+	// 不设 ReadTimeout/WriteTimeout：WS 升级 hijack 后 deadline 由 wstgo
+	// 自己管理，http 层的 deadline 会干扰长连隧道。
+	srv := &http.Server{
+		Addr:              bindAddr,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	if tlsCert != "" {
 		log.Printf("wstgo server listening on %s (wss), forwarding to %s", bindAddr, destAddr)
-		log.Fatal(http.ListenAndServeTLS(bindAddr, tlsCert, tlsKey, nil))
+		log.Fatal(srv.ListenAndServeTLS(tlsCert, tlsKey))
 	}
 	log.Printf("wstgo server listening on %s (ws), forwarding to %s", bindAddr, destAddr)
-	log.Fatal(http.ListenAndServe(bindAddr, nil))
+	log.Fatal(srv.ListenAndServe())
 }

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -300,8 +301,9 @@ type testTLS struct {
 }
 
 // genTestTLS 生成测试用 CA 与叶子证书（ECDSA P-256，生成足够快）。
-// withIPSAN 控制叶子证书是否带 127.0.0.1 的 IP SAN。
-func genTestTLS(t *testing.T, withIPSAN bool) testTLS {
+// withIPSAN 控制叶子证书是否带 127.0.0.1 的 IP SAN；expired=true 时
+// 叶子证书签成已过期（NotAfter 在过去）。
+func genTestTLS(t *testing.T, withIPSAN bool, expired bool) testTLS {
 	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -329,11 +331,15 @@ func genTestTLS(t *testing.T, withIPSAN bool) testTLS {
 	if err != nil {
 		t.Fatal(err)
 	}
+	leafNotAfter := time.Now().Add(time.Hour)
+	if expired {
+		leafNotAfter = time.Now().Add(-time.Hour)
+	}
 	leafTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: "wstgo test leaf"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    time.Now().Add(-2 * time.Hour),
+		NotAfter:     leafNotAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
@@ -371,7 +377,7 @@ func startTunnelTLSServer(t *testing.T, cert tls.Certificate, wl *publicKeyWhite
 }
 
 func TestLoadCACertPool(t *testing.T) {
-	tlsPair := genTestTLS(t, true)
+	tlsPair := genTestTLS(t, true, false)
 	dir := t.TempDir()
 
 	// PEM
@@ -405,7 +411,7 @@ func TestLoadCACertPool(t *testing.T) {
 
 func TestTunnelWithCACert(t *testing.T) {
 	// CA 签发 + 叶子带 IP SAN：标准校验路径下完整隧道可用
-	tlsPair := genTestTLS(t, true)
+	tlsPair := genTestTLS(t, true, false)
 	dir := t.TempDir()
 	priv, _ := genTestKeyPair(t, dir)
 	wl, _, err := loadWhitelistFromDir(dir)
@@ -432,7 +438,7 @@ func TestTunnelWithCACert(t *testing.T) {
 
 func TestTunnelInsecureAgainstTLS(t *testing.T) {
 	// insecure 路径对 TLS 服务端仍然可用（回归保护）
-	tlsPair := genTestTLS(t, true)
+	tlsPair := genTestTLS(t, true, false)
 	dir := t.TempDir()
 	priv, _ := genTestKeyPair(t, dir)
 	wl, _, err := loadWhitelistFromDir(dir)
@@ -472,8 +478,8 @@ func failTLSClient(t *testing.T, clientAddr string) {
 
 func TestTunnelWrongCARejected(t *testing.T) {
 	// 服务端证书由 CA-A 签发，客户端只信任 CA-B：标准校验必须拒绝
-	serverTLS := genTestTLS(t, true)
-	clientTrustedTLS := genTestTLS(t, true) // 另一套独立 CA
+	serverTLS := genTestTLS(t, true, false)
+	clientTrustedTLS := genTestTLS(t, true, false) // 另一套独立 CA
 
 	dir := t.TempDir()
 	priv, _ := genTestKeyPair(t, dir)
@@ -496,7 +502,7 @@ func TestTunnelWrongCARejected(t *testing.T) {
 func TestTunnelCACertHostnameMismatch(t *testing.T) {
 	// CA 信任了，但叶子证书没有 IP SAN：标准语义下主机名校验必须失败——
 	// 这正是自签证书必须把 IP 写进 SAN 的原因（文档化行为）。
-	serverTLS := genTestTLS(t, false) // 无 IP SAN
+	serverTLS := genTestTLS(t, false, false) // 无 IP SAN
 	dir := t.TempDir()
 	priv, _ := genTestKeyPair(t, dir)
 	wl, _, err := loadWhitelistFromDir(dir)
@@ -534,7 +540,7 @@ bind = "127.0.0.1:50022"
 func TestRunClientConfigWithCACertEndToEnd(t *testing.T) {
 	// 配置文件模式全链路：TOML（含 cacert）→ loadConfig → runClientConfig
 	// → 标准 TLS 校验 → 隧道 roundtrip → SIGTERM 收尾（顺带验证信号路径）。
-	tlsPair := genTestTLS(t, true)
+	tlsPair := genTestTLS(t, true, false)
 	dir := t.TempDir()
 	priv, _ := genTestKeyPair(t, dir) // 生成 private.pem/public.pem 供配置引用
 	_ = priv
@@ -614,5 +620,324 @@ bind = "127.0.0.1:%d"
 			t.Fatal("listener still accepting after SIGTERM")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// ---- 桥接生命周期：任何一侧关闭都必须及时传播到另一端 ----
+
+// TestLocalCloseTearsDownTunnel 本地 app 断开后，server 端的 target 连接
+// 必须被及时关闭（回归：曾经因心跳续约被永久焊住，泄漏 target 连接）。
+func TestLocalCloseTearsDownTunnel(t *testing.T) {
+	targetClosed := make(chan struct{}, 1)
+	tl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+	go func() {
+		for {
+			c, err := tl.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				io.Copy(c, c)
+				c.Close()
+				select {
+				case targetClosed <- struct{}{}:
+				default:
+				}
+			}(c)
+		}
+	}()
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, tl.Addr().String())
+	clientAddr := startTunnelClient(t, priv, serverURL, false, nil)
+
+	conn, err := net.Dial("tcp", clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundtrip(t, conn, []byte("ping")) // 先确认隧道可用
+	conn.Close()                       // 本地 app 断开
+
+	select {
+	case <-targetClosed:
+		// 及时拆除 ✓
+	case <-time.After(5 * time.Second):
+		t.Fatal("server-side target conn STILL OPEN 5s after local close (teardown not propagated)")
+	}
+}
+
+// TestTargetCloseReachesLocal target 关闭后，客户端本地连接必须很快看到
+// 断开（回归：曾经本地 app 挂死到读超时）。
+func TestTargetCloseReachesLocal(t *testing.T) {
+	tl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+	go func() {
+		c, err := tl.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			buf := make([]byte, 64)
+			n, _ := c.Read(buf)
+			c.Write(buf[:n])
+			time.Sleep(200 * time.Millisecond)
+			c.Close() // target 主动断开
+		}(c)
+	}()
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, tl.Addr().String())
+	clientAddr := startTunnelClient(t, priv, serverURL, false, nil)
+
+	conn, err := net.Dial("tcp", clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundtrip(t, conn, []byte("ping"))
+
+	start := time.Now()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, 16)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("expected error after target close, got none")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("local conn hung %.1fs after target close (teardown not propagated)", elapsed.Seconds())
+	}
+}
+
+// TestSlowConsumerWriteDeadline 对端停止消费时，数据写必须在 writeWait
+// 内超时拆除（回归：曾经无写超时，心跳续约把死链永久焊住）。
+func TestSlowConsumerWriteDeadline(t *testing.T) {
+	oldWriteWait := writeWait.Load()
+	writeWait.Store(int64(200 * time.Millisecond))
+	t.Cleanup(func() { writeWait.Store(oldWriteWait) })
+
+	// target 监听：无限写循环在下方启动（对端不读就把中间所有缓冲填满）
+	tl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, tl.Addr().String())
+	clientAddr := startTunnelClient(t, priv, serverURL, false, nil)
+
+	// "app" 连上后从不读取；从 target 侧观测：server 数据写超时拆除时会
+	// 关闭 target 连接，无限写循环立刻报错退出。
+	writeFailed := make(chan struct{}, 1)
+	go func() {
+		c, err := tl.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			chunk := make([]byte, ioBufSize)
+			for {
+				if _, err := c.Write(chunk); err != nil {
+					select {
+					case writeFailed <- struct{}{}:
+					default:
+					}
+					return
+				}
+			}
+		}(c)
+	}()
+
+	conn, err := net.Dial("tcp", clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	start := time.Now()
+	select {
+	case <-writeFailed:
+		// server 写超时 → 拆除 → target 连接被关 ✓
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow consumer not torn down within 5s (write deadline missing?)")
+	}
+	_ = start
+}
+
+// ---- P2 补齐：证书过期 / 心跳语义 / 重试语义 ----
+
+func TestExpiredCertRejected(t *testing.T) {
+	// x509 三分支的第三个：过期证书也必须快速失败不重试
+	serverTLS := genTestTLS(t, true, true) // 过期叶子
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelTLSServer(t, *serverTLS.server, wl, startEchoServer(t))
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	os.WriteFile(caPath, serverTLS.caPEM, 0o600) // CA 是信任的，过期的是叶子
+	caPool, err := loadCACertPool(caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientAddr := startTunnelClient(t, priv, serverURL, false, caPool)
+	failTLSClient(t, clientAddr)
+}
+
+// TestHeartbeatKeepsIdleAlive 心跳续约必须让空闲连接活过 readTimeout。
+func TestHeartbeatKeepsIdleAlive(t *testing.T) {
+	oldHB, oldRT := heartbeatInterval.Load(), readTimeout.Load()
+	heartbeatInterval.Store(int64(20 * time.Millisecond))
+	readTimeout.Store(int64(100 * time.Millisecond))
+	t.Cleanup(func() {
+		heartbeatInterval.Store(oldHB)
+		readTimeout.Store(oldRT)
+	})
+
+	clientAddr := setupTunnel(t)
+	conn, err := net.Dial("tcp", clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	time.Sleep(500 * time.Millisecond) // 5 倍 readTimeout 的空闲期
+	roundtrip(t, conn, []byte("still alive after idle"))
+}
+
+// TestSilentConnDropped 无心跳的静默连接必须在 readTimeout 内被服务端拆除。
+func TestSilentConnDropped(t *testing.T) {
+	oldRT := readTimeout.Load()
+	readTimeout.Store(int64(100 * time.Millisecond))
+	t.Cleanup(func() { readTimeout.Store(oldRT) })
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, startEchoServer(t))
+
+	// 原始 WS 客户端：握手完成后不发任何数据、不发心跳
+	d := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+	ws, _, err := d.Dial(serverURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadLimit(maxMessageSize)
+	if err := clientHandshake(ws, priv); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := ws.ReadMessage(); err == nil {
+		t.Fatal("silent conn should be dropped by server")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("silent conn kept alive %.1fs (read timeout not enforced)", elapsed.Seconds())
+	}
+}
+
+// startFlakyTunnelServer 前 failFirst 次 HTTP 503，之后正常升级。
+// 返回尝试计数指针，用于断言重试确实发生。
+func startFlakyTunnelServer(t *testing.T, wl *publicKeyWhitelist, target string, failFirst int) (string, *int32) {
+	t.Helper()
+	var count int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&count, 1) <= int32(failFirst) {
+			http.Error(w, "try again", http.StatusServiceUnavailable)
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serveTunnel(ws, wl, target, "", r.RemoteAddr)
+	})
+	s := httptest.NewServer(mux)
+	t.Cleanup(s.Close)
+	return "ws" + strings.TrimPrefix(s.URL, "http") + "/ws", &count
+}
+
+// TestRetryThenSuccess 瞬态故障（503）后重试必须能恢复隧道——
+// 证明退避重试真的发生并最终成功，而不只是耗尽后失败。
+func TestRetryThenSuccess(t *testing.T) {
+	oldInit := dialRetryInitial
+	dialRetryInitial = time.Millisecond
+	t.Cleanup(func() { dialRetryInitial = oldInit })
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL, attempts := startFlakyTunnelServer(t, wl, startEchoServer(t), 2)
+	clientAddr := startTunnelClient(t, priv, serverURL, false, nil)
+
+	conn, err := net.Dial("tcp", clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundtrip(t, conn, []byte("recovered after transient failures"))
+	conn.Close()
+
+	if got := atomic.LoadInt32(attempts); got < 3 {
+		t.Fatalf("expected at least 3 dial attempts (2 failures + 1 success), got %d", got)
+	}
+}
+
+// TestDialRetryExhaustionCounts 重试耗尽时的尝试次数必须精确等于
+// dialRetryMaxNum（锚定重试循环本身，而不只是最终错误）。
+func TestDialRetryExhaustionCounts(t *testing.T) {
+	oldInit, oldMax := dialRetryInitial, dialRetryMaxNum
+	dialRetryInitial = time.Millisecond
+	dialRetryMaxNum = 3
+	t.Cleanup(func() { dialRetryInitial, dialRetryMaxNum = oldInit, oldMax })
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL, attempts := startFlakyTunnelServer(t, wl, startEchoServer(t), 1000)
+
+	_, err = dialWithRetry(serverURL, priv, false, nil)
+	if err == nil {
+		t.Fatal("expected exhaustion error")
+	}
+	if got := atomic.LoadInt32(attempts); got != 3 {
+		t.Fatalf("expected exactly 3 attempts, got %d", got)
 	}
 }
