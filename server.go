@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"maps"
@@ -88,7 +89,8 @@ func serveTunnel(ws *websocket.Conn, wl *publicKeyWhitelist, target, label, remo
 		if pub != nil {
 			fp = publicKeyFingerprint(pub)
 		}
-		if ae, ok := err.(*authError); ok {
+		var ae *authError
+		if errors.As(err, &ae) {
 			log.Printf("auth failed from %s (%s): %s", remoteAddr, fp, ae.reason)
 			sendAuthFail(ws, ae.reason)
 		} else {
@@ -99,16 +101,21 @@ func serveTunnel(ws *websocket.Conn, wl *publicKeyWhitelist, target, label, remo
 	log.Printf("tunnel established: %s <-> %s%s (client=%s)",
 		remoteAddr, target, labelSuffix(label), publicKeyFingerprint(pub))
 
-	// 2. 拨号目标 TCP
+	// 2. 心跳与拨号：先装心跳再拨目标——拨号期间（最长 5s）WS 也受读
+	// 超时保护，消除握手后到桥接启动之间的 deadline 空窗。
+	installHeartbeat(ws)
+
+	// 3. 拨号目标 TCP
 	tcp, err := (&net.Dialer{Timeout: time.Duration(targetDialTimeout.Load())}).Dial("tcp", target)
 	if err != nil {
 		log.Printf("dial target %s: %v", target, err)
+		// 带原因关闭，客户端能区分"目标不可达"与网络故障
+		_ = ws.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "target unreachable"),
+			time.Now().Add(time.Duration(writeWait.Load())))
 		return
 	}
 	defer tcp.Close()
-
-	// 3. 设置心跳：续约读超时 + 自动回 Pong
-	installHeartbeat(ws)
 
 	// 4. 双向桥接
 	ctx, cancel := context.WithCancel(context.Background())
@@ -261,11 +268,17 @@ func bridge(ws *websocket.Conn, tcp net.Conn, ctx context.Context, cancel contex
 			return
 		default:
 		}
-		_, buf, err := ws.ReadMessage()
+		msgType, buf, err := ws.ReadMessage()
 		if err != nil {
 			if serverSide || !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Printf("%s%s read err: %v", dir2, tag, err)
 			}
+			teardown()
+			return
+		}
+		if msgType != websocket.BinaryMessage {
+			// 协议约定数据帧一律 Binary：非二进制帧按协议违例拆除
+			log.Printf("%s%s non-binary data frame, closing", dir2, tag)
 			teardown()
 			return
 		}

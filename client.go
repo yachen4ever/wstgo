@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"net"
@@ -74,12 +75,32 @@ func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool, 
 		if err == nil {
 			// 与 server 端对称：限制单帧大小，防止对端异常大帧
 			ws.SetReadLimit(maxMessageSize)
-			if err = clientHandshake(ws, priv); err == nil {
+			err = clientHandshake(ws, priv)
+			if err == nil {
 				return ws, nil
 			}
-			// 握手失败通常不可重试（密钥错误/协议不符），直接返回
 			ws.Close()
-			return nil, err
+			var ae *authError
+			if errors.As(err, &ae) {
+				// 密钥/协议问题重试无意义，立即失败
+				return nil, err
+			}
+			// 传输类错误（握手超时、对端恰在重启的 RST 等）按退避重试
+			lastErr = err
+			log.Printf("handshake attempt %d/%d failed: %v", attempt, dialRetryMaxNum, err)
+			if attempt < dialRetryMaxNum {
+				time.Sleep(backoff)
+				backoff *= 2
+				if backoff > dialRetryMax {
+					backoff = dialRetryMax
+				}
+			}
+			continue
+		}
+		// gorilla 约定：握手失败时调用方负责关闭 resp.Body
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
 		}
 		if errors.Is(err, websocket.ErrBadHandshake) && resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("dial %s: 404 not found (no [server.*] forward with this label on the server?)", websocketURL)

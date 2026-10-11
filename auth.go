@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -30,6 +31,34 @@ const (
 
 // authDeadline 握手超时，防慢速认证攻击。var 是为了测试可注入短超时。
 var authDeadline = 10 * time.Second
+
+// readHandshakeMsg 读一帧握手消息并校验：必须是 BinaryMessage 且类型字节
+// 正确、长度精确。协议外帧（Text 等）直接拒绝，不给对端试探空间。
+func readHandshakeMsg(ws *websocket.Conn, want byte, wantLen int) ([]byte, error) {
+	msgType, buf, err := ws.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+	if msgType != websocket.BinaryMessage {
+		return nil, &authError{reason: "non-binary handshake frame"}
+	}
+	if len(buf) != wantLen || buf[0] != want {
+		return nil, &authError{reason: "malformed handshake message"}
+	}
+	return buf, nil
+}
+
+// sanitizeReason 过滤控制字符与 DEL：服务端下发的拒绝原因会进入客户端
+// 日志，被劫持的服务端（或 ws:// 明文下的中间人）不应能借它注入换行、
+// ANSI 转义等日志内容。
+func sanitizeReason(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\t') || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
 
 // authError 表示握手失败的具体原因，方便 server 端打日志。
 type authError struct {
@@ -73,13 +102,10 @@ func serverHandshake(ws *websocket.Conn, whitelist *publicKeyWhitelist) (ed25519
 		return nil, fmt.Errorf("send nonce: %w", err)
 	}
 
-	// 2. 读 client 的认证消息
-	_, buf, err := ws.ReadMessage()
+	// 2. 读 client 的认证消息（Binary、类型与长度严格校验）
+	buf, err := readHandshakeMsg(ws, msgAuth, lenAuthMsg)
 	if err != nil {
 		return nil, fmt.Errorf("read auth: %w", err)
-	}
-	if len(buf) != lenAuthMsg || buf[0] != msgAuth {
-		return nil, &authError{reason: "malformed auth message"}
 	}
 	pub := ed25519.PublicKey(buf[1 : 1+ed25519.PublicKeySize])
 	sig := buf[1+ed25519.PublicKeySize:]
@@ -128,9 +154,12 @@ func clientHandshake(ws *websocket.Conn, priv ed25519.PrivateKey) error {
 
 	// 1. 收 nonce。服务端在发 nonce 之前就可能拒绝（如白名单为空），
 	// 此时首帧是 [0x04]，把真实原因透传给调用方而不是报"格式错误"。
-	_, buf, err := ws.ReadMessage()
+	msgType, buf, err := ws.ReadMessage()
 	if err != nil {
 		return fmt.Errorf("read nonce: %w", err)
+	}
+	if msgType != websocket.BinaryMessage {
+		return &authError{reason: "non-binary handshake frame"}
 	}
 	if len(buf) < 1 {
 		return &authError{reason: "empty nonce message"}
@@ -138,7 +167,7 @@ func clientHandshake(ws *websocket.Conn, priv ed25519.PrivateKey) error {
 	if buf[0] == msgAuthFail {
 		reason := "rejected"
 		if len(buf) > 1 {
-			reason = string(buf[1:])
+			reason = sanitizeReason(string(buf[1:]))
 		}
 		return &authError{reason: reason}
 	}
@@ -160,9 +189,12 @@ func clientHandshake(ws *websocket.Conn, priv ed25519.PrivateKey) error {
 	}
 
 	// 3. 收结果
-	_, buf, err = ws.ReadMessage()
+	msgType, buf, err = ws.ReadMessage()
 	if err != nil {
 		return fmt.Errorf("read auth result: %w", err)
+	}
+	if msgType != websocket.BinaryMessage {
+		return &authError{reason: "non-binary handshake frame"}
 	}
 	if len(buf) < 1 {
 		return &authError{reason: "empty auth result"}
@@ -173,7 +205,7 @@ func clientHandshake(ws *websocket.Conn, priv ed25519.PrivateKey) error {
 	case msgAuthFail:
 		reason := "rejected"
 		if len(buf) > 1 {
-			reason = string(buf[1:])
+			reason = sanitizeReason(string(buf[1:]))
 		}
 		return &authError{reason: reason}
 	default:

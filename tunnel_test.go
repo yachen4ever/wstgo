@@ -941,3 +941,90 @@ func TestDialRetryExhaustionCounts(t *testing.T) {
 		t.Fatalf("expected exactly 3 attempts, got %d", got)
 	}
 }
+
+// ---- P3：单帧上限 / 握手瞬态重试 / 多证书 PEM ----
+
+func TestMaxMessageSizeEnforced(t *testing.T) {
+	// 未鉴权对端发 65KB+ 帧（> maxMessageSize）：连接必须被立即拆除，
+	// 防止无界内存分配
+	dir := t.TempDir()
+	genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	url, results := startAuthTestServer(t, wl)
+
+	ws := dialWS(t, url)
+	readFrame(t, ws) // nonce
+	big := make([]byte, maxMessageSize+1)
+	ws.WriteMessage(websocket.BinaryMessage, big)
+
+	r := waitResult(t, results)
+	if r.err == nil {
+		t.Fatal("oversized pre-auth frame should tear the connection down")
+	}
+}
+
+// TestHandshakeTransientRetry 握手阶段的传输类错误（对端恰在重启时
+// 断开）会退避重试；密钥/协议类错误仍不重试。
+func TestHandshakeTransientRetry(t *testing.T) {
+	oldInit := dialRetryInitial
+	dialRetryInitial = time.Millisecond
+	t.Cleanup(func() { dialRetryInitial = oldInit })
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoAddr := startEchoServer(t)
+
+	var count int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&count, 1) <= 2 {
+			// 前两次：升级后立刻断开（不回 nonce），模拟重启中的服务端
+			ws, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			ws.Close()
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serveTunnel(ws, wl, echoAddr, "", r.RemoteAddr)
+	})
+	s := httptest.NewServer(mux)
+	t.Cleanup(s.Close)
+	serverURL := "ws" + strings.TrimPrefix(s.URL, "http") + "/ws"
+
+	clientAddr := startTunnelClient(t, priv, serverURL, false, nil)
+	conn, err := net.Dial("tcp", clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundtrip(t, conn, []byte("recovered after transient handshake failures"))
+	conn.Close()
+
+	if got := atomic.LoadInt32(&count); got < 3 {
+		t.Fatalf("expected at least 3 handshake attempts, got %d", got)
+	}
+}
+
+func TestLoadCACertPoolMultiCertPEM(t *testing.T) {
+	// 根 CA + 叶子拼在一个 PEM 里：loadCACertPool 注释声称支持，验证之
+	tlsPair := genTestTLS(t, true, false)
+	leafDER := tlsPair.server.Certificate[0]
+	combined := append(append([]byte{}, tlsPair.caPEM...),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})...)
+	p := filepath.Join(t.TempDir(), "chain.pem")
+	os.WriteFile(p, combined, 0o600)
+	if _, err := loadCACertPool(p); err != nil {
+		t.Fatalf("multi-cert PEM should load: %v", err)
+	}
+}

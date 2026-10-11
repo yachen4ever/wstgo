@@ -32,7 +32,8 @@ func startAuthTestServer(t *testing.T, wl *publicKeyWhitelist) (wsURL string, re
 		ws.SetReadLimit(maxMessageSize)
 		pub, err := serverHandshake(ws, wl)
 		ch <- handshakeResult{pub, err}
-		if ae, ok := err.(*authError); ok {
+		var ae *authError
+		if errors.As(err, &ae) {
 			sendAuthFail(ws, ae.reason)
 			return
 		}
@@ -175,7 +176,7 @@ func TestHandshakeMalformedAuth(t *testing.T) {
 	ws := dialWS(t, url)
 	readFrame(t, ws) // nonce
 	ws.WriteMessage(websocket.BinaryMessage, []byte{0x99, 0x01, 0x02})
-	expectAuthFail(t, ws, "malformed auth message")
+	expectAuthFail(t, ws, "malformed handshake message")
 	waitResult(t, results)
 }
 
@@ -313,4 +314,85 @@ func TestHandshakePicksUpNewlyAddedKey(t *testing.T) {
 	if r := waitResult(t, results); r.err != nil {
 		t.Fatalf("server should accept newly whitelisted key, got %v", r.err)
 	}
+}
+
+// ---- P3：严格帧校验 / 原因消毒 ----
+
+func TestHandshakeTextFrameRejected(t *testing.T) {
+	// Text 帧当 nonce：协议要求握手帧一律 Binary，必须拒绝
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		ws.WriteMessage(websocket.TextMessage, []byte{msgNonce, 1, 2, 3})
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(s.Close)
+	url := "ws" + strings.TrimPrefix(s.URL, "http")
+
+	ws := dialWS(t, url)
+	priv, _ := genTestKeyPair(t, t.TempDir())
+	err := clientHandshake(ws, priv)
+	if err == nil || !strings.Contains(err.Error(), "non-binary handshake frame") {
+		t.Fatalf("text nonce frame should be rejected, got %v", err)
+	}
+}
+
+func TestHandshakeRejectReasonSanitized(t *testing.T) {
+	// 服务端下发的原因串经客户端消毒：控制字符/ANSI 不得进入日志
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		payload := append([]byte{msgAuthFail}, []byte("line1\n\x1b[31mred\x07")...)
+		ws.WriteMessage(websocket.BinaryMessage, payload)
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(s.Close)
+	url := "ws" + strings.TrimPrefix(s.URL, "http")
+
+	ws := dialWS(t, url)
+	priv, _ := genTestKeyPair(t, t.TempDir())
+	err := clientHandshake(ws, priv)
+	var ae *authError
+	if !errors.As(err, &ae) {
+		t.Fatalf("want authError, got %v", err)
+	}
+	if ae.reason != "line1[31mred" {
+		t.Fatalf("reason should be sanitized to %q, got %q", "line1[31mred", ae.reason)
+	}
+}
+
+func TestHandshakeWrongLengthAuthRejected(t *testing.T) {
+	// 类型字节对但长度不对的 auth 帧（96 字节 vs 97）：严格长度校验必须拦下
+	dir := t.TempDir()
+	_, pubW := genTestKeyPair(t, dir)
+	_ = pubW
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	url, results := startAuthTestServer(t, wl)
+
+	priv, _ := genTestKeyPair(t, t.TempDir())
+	ws := dialWS(t, url)
+	nonceMsg := readFrame(t, ws)
+	bad := make([]byte, lenAuthMsg-1) // 少 1 字节
+	bad[0] = msgAuth
+	copy(bad[1:], ed25519.Sign(priv, nonceMsg[1:]))
+	ws.WriteMessage(websocket.BinaryMessage, bad)
+	expectAuthFail(t, ws, "malformed handshake message")
+	waitResult(t, results)
 }
