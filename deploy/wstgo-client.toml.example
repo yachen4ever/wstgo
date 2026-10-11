@@ -16,7 +16,7 @@ allow_insecure = false
 
 [client]
 # 每个条目 = 一个本地监听端口，连到服务端同名标签的转发
-# type 可选，仅用于日志标识
+# type 可选：ssh / db / 留空(generic)，用于校验防 typo 与日志标识
 [client.ssh1]
 bind = "127.0.0.1:50022"
 type = "ssh"

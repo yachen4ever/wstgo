@@ -318,3 +318,29 @@ func TestTypeNameAndSuffixHelpers(t *testing.T) {
 		t.Errorf("labelSuffix(\"pg1\") = %q, want \" [pg1]\"", got)
 	}
 }
+
+func TestRunArgs(t *testing.T) {
+	cases := []struct {
+		subCmd string
+		rest   []string
+		want   []string
+	}{
+		{"run", []string{"-config", "f.toml"}, []string{"-config", "f.toml"}},
+		{"run", []string{"-config", "f.toml", "-v"}, []string{"-config", "f.toml", "-v"}},
+		{"-config", []string{"f.toml"}, []string{"-config", "f.toml"}},
+		{"--config", []string{"f.toml"}, []string{"--config", "f.toml"}},
+		{"run", nil, nil},
+		{"-config", nil, []string{"-config"}},
+	}
+	for _, tc := range cases {
+		got := runArgs(tc.subCmd, tc.rest)
+		if len(got) != len(tc.want) {
+			t.Fatalf("runArgs(%q, %v) = %v, want %v", tc.subCmd, tc.rest, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("runArgs(%q, %v) = %v, want %v", tc.subCmd, tc.rest, got, tc.want)
+			}
+		}
+	}
+}

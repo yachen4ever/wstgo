@@ -275,8 +275,13 @@ func TestHandshakeTimeout(t *testing.T) {
 	if _, _, err := ws.ReadMessage(); err == nil {
 		t.Fatal("server should close the connection after auth deadline")
 	}
-	if r := waitResult(t, results); r.err == nil {
+	// 锚定超时本身（而非任意提前关闭）：服务端错误必须是 deadline 类
+	r := waitResult(t, results)
+	if r.err == nil {
 		t.Fatal("server handshake should fail on deadline")
+	}
+	if !strings.Contains(r.err.Error(), "i/o timeout") && !strings.Contains(r.err.Error(), "deadline exceeded") {
+		t.Fatalf("handshake failure should be a deadline timeout, got %v", r.err)
 	}
 }
 

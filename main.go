@@ -10,6 +10,15 @@ import (
 // 脚本: -ldflags "-X main.version=$(git describe --tags --always 2>/dev/null || echo dev)"
 var version = "dev"
 
+// runArgs 规整两种调用形态：`run -config f` 原样返回；裸 `-config/--config f`
+// 把子命令本身并入参数（等价于 run -config f）。
+func runArgs(subCmd string, rest []string) []string {
+	if subCmd == "run" {
+		return rest
+	}
+	return append([]string{subCmd}, rest...)
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, "wstgo %s - TCP over WebSocket with ed25519 challenge-response auth\n", version)
 	fmt.Fprintln(os.Stderr, "")
@@ -22,11 +31,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "Subcommands:")
 	fmt.Fprintln(os.Stderr, "  genkey   Generate an ed25519 keypair into -dir (private.pem + public.pem).")
 	fmt.Fprintln(os.Stderr, "  server   Run tunnel server (single target): accepts WS/WSS on -bind, forwards TCP")
-	fmt.Fprintln(os.Stderr, "           to -target, authorizes clients whose public keys are in -authdir/*.pem.")
+	fmt.Fprintln(os.Stderr, "           to -target, authorizes clients whose public keys are in -authdir (any filename).")
 	fmt.Fprintln(os.Stderr, "           Native wss:// is opt-in: pass both -tlscert and -tlskey.")
 	fmt.Fprintln(os.Stderr, "  client   Run tunnel client (single target): listens TCP on -bind, forwards via WS")
 	fmt.Fprintln(os.Stderr, "           -url, authenticates with -key private key.")
-	fmt.Fprintln(os.Stderr, "           Use -insecure with wss:// to skip TLS cert verification (self-signed).")
+	fmt.Fprintln(os.Stderr, "           Self-signed wss://: prefer -cacert <ca.crt>; -insecure skips TLS")
+	fmt.Fprintln(os.Stderr, "           verification entirely (temporary debugging only).")
 	fmt.Fprintln(os.Stderr, "  run      Run from a TOML config file: one process forwards multiple ports,")
 	fmt.Fprintln(os.Stderr, "           routed by label as /ws/<label>; `wstgo -config <file>` is a shorthand.")
 	fmt.Fprintln(os.Stderr, "")
@@ -67,7 +77,7 @@ func main() {
 		fs := flag.NewFlagSet("server", flag.ExitOnError)
 		bind := fs.String("bind", "0.0.0.0:8888", "address to listen for WS")
 		target := fs.String("target", "", "destination TCP address (e.g. 127.0.0.1:25565)")
-		authDir := fs.String("authdir", "./keys", "directory containing authorized *.pem public keys")
+		authDir := fs.String("authdir", "./keys", "directory of authorized client public keys (any filename)")
 		tlsCert := fs.String("tlscert", "", "TLS certificate PEM (set with -tlskey to serve native wss://)")
 		tlsKey := fs.String("tlskey", "", "TLS private key PEM (set with -tlscert to serve native wss://)")
 		v := fs.Bool("v", false, "verbose: log per-byte traffic direction (C→S/S→C)")
@@ -96,15 +106,11 @@ func main() {
 		client(*bind, *url, *keyPath, *insecure, *caCert)
 
 	case "run", "-config", "--config":
-		// run -config <file>；裸 -config <file> 为等价简写
-		args := os.Args[2:]
-		if os.Args[1] != "run" {
-			args = os.Args[1:]
-		}
+		// run -config <file>；裸 -config/--config <file> 为等价简写
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		configPath := fs.String("config", "", "path to wstgo.toml")
 		v := fs.Bool("v", false, "verbose: log per-byte traffic direction (with forward labels)")
-		_ = fs.Parse(args)
+		_ = fs.Parse(runArgs(os.Args[1], os.Args[2:]))
 		verbose = *v
 		if *configPath == "" {
 			fmt.Fprintln(os.Stderr, "run: -config is required")
