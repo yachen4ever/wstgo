@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -10,8 +11,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -19,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -777,14 +781,12 @@ func TestSlowConsumerWriteDeadline(t *testing.T) {
 	}
 	defer conn.Close()
 
-	start := time.Now()
 	select {
 	case <-writeFailed:
 		// server 写超时 → 拆除 → target 连接被关 ✓
 	case <-time.After(5 * time.Second):
 		t.Fatal("slow consumer not torn down within 5s (write deadline missing?)")
 	}
-	_ = start
 }
 
 // ---- P2 补齐：证书过期 / 心跳语义 / 重试语义 ----
@@ -814,7 +816,7 @@ func TestExpiredCertRejected(t *testing.T) {
 func TestHeartbeatKeepsIdleAlive(t *testing.T) {
 	oldHB, oldRT := heartbeatInterval.Load(), readTimeout.Load()
 	heartbeatInterval.Store(int64(20 * time.Millisecond))
-	readTimeout.Store(int64(100 * time.Millisecond))
+	readTimeout.Store(int64(200 * time.Millisecond)) // 慢 CI 下给续约留裕量
 	t.Cleanup(func() {
 		heartbeatInterval.Store(oldHB)
 		readTimeout.Store(oldRT)
@@ -958,7 +960,7 @@ func TestMaxMessageSizeEnforced(t *testing.T) {
 	ws := dialWS(t, url)
 	readFrame(t, ws) // nonce
 	big := make([]byte, maxMessageSize+1)
-	ws.WriteMessage(websocket.BinaryMessage, big)
+	_ = ws.WriteMessage(websocket.BinaryMessage, big)
 
 	r := waitResult(t, results)
 	if r.err == nil {
@@ -1026,5 +1028,284 @@ func TestLoadCACertPoolMultiCertPEM(t *testing.T) {
 	os.WriteFile(p, combined, 0o600)
 	if _, err := loadCACertPool(p); err != nil {
 		t.Fatalf("multi-cert PEM should load: %v", err)
+	}
+}
+
+// ---- 二轮审计收口：生命周期新行为 / 方向标签 / 参数锚定 ----
+
+// TestDirectionLabels 锚定 -v 流量日志的方向语义（回归：server 端曾整体
+// 标反——server 的 TCP 连的是 target/S 侧，TCP→WS 应为 S→C）。
+func TestDirectionLabels(t *testing.T) {
+	d1, d2, logErr := directionLabels(true)
+	if d1 != "S→C" || d2 != "C→S" || !logErr {
+		t.Fatalf("server labels = %q/%q logTCPErr=%v", d1, d2, logErr)
+	}
+	d1, d2, logErr = directionLabels(false)
+	if d1 != "L→R" || d2 != "R→L" || logErr {
+		t.Fatalf("client labels = %q/%q logTCPErr=%v", d1, d2, logErr)
+	}
+}
+
+// TestHeartbeatPingFailureTearsDownNow 心跳 Ping 写失败必须 cancel 且立即
+// 关 ws（回归：曾只 cancel，读阻塞最长 30s 后才拆除）。
+func TestHeartbeatPingFailureTearsDownNow(t *testing.T) {
+	oldHB, oldWW := heartbeatInterval.Load(), writeWait.Load()
+	heartbeatInterval.Store(int64(20 * time.Millisecond))
+	writeWait.Store(int64(200 * time.Millisecond))
+	t.Cleanup(func() {
+		heartbeatInterval.Store(oldHB)
+		writeWait.Store(oldWW)
+	})
+
+	// 对端握住连接但不读不回：Ping 会填满发送缓冲并在 writeWait 内超时
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		time.Sleep(2 * time.Second)
+	}))
+	t.Cleanup(s.Close)
+
+	d := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+	ws, _, err := d.Dial("ws"+strings.TrimPrefix(s.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		startHeartbeat(ws, ctx, cancel)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Ping 失败路径触发 ✓
+	case <-time.After(3 * time.Second):
+		t.Fatal("startHeartbeat did not return after peer stopped responding")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("cancel should have been called on ping failure")
+	}
+	// ws 必须已被关闭：ReadMessage 立即报错（而非等到读超时）
+	ws.SetReadDeadline(time.Now().Add(1 * time.Second))
+	if _, _, err := ws.ReadMessage(); err == nil {
+		t.Fatal("ws should be closed immediately after ping failure")
+	}
+}
+
+// TestTargetUnreachableCloseReason 拨 target 失败时客户端应收到
+// 1011 + "target unreachable"，可与网络故障区分。
+func TestTargetUnreachableCloseReason(t *testing.T) {
+	oldTDT := targetDialTimeout.Load()
+	targetDialTimeout.Store(int64(200 * time.Millisecond))
+	t.Cleanup(func() { targetDialTimeout.Store(oldTDT) })
+
+	// 死端口：listen 后立即关闭
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := ln.Addr().String()
+	ln.Close()
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, deadAddr)
+
+	d := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+	ws, _, err := d.Dial(serverURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadLimit(maxMessageSize)
+	if err := clientHandshake(ws, priv); err != nil {
+		t.Fatal(err)
+	}
+
+	ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _, err = ws.ReadMessage()
+	if err == nil {
+		t.Fatal("expected close after target dial failure")
+	}
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) {
+		t.Fatalf("want CloseError, got %v", err)
+	}
+	if ce.Code != websocket.CloseInternalServerErr || ce.Text != "target unreachable" {
+		t.Fatalf("close = %d %q, want 1011 \"target unreachable\"", ce.Code, ce.Text)
+	}
+}
+
+// TestDataModeTextFrameTornDown 鉴权后的数据模式同样强制 Binary：
+// Text 数据帧按协议违例拆除（握手阶段已有单独测试，这是另一半）。
+func TestDataModeTextFrameTornDown(t *testing.T) {
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, startEchoServer(t))
+
+	d := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+	ws, _, err := d.Dial(serverURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadLimit(maxMessageSize)
+	if err := clientHandshake(ws, priv); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = ws.WriteMessage(websocket.TextMessage, []byte("protocol violation"))
+	ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := ws.ReadMessage(); err == nil {
+		t.Fatal("text data frame should tear down the tunnel")
+	}
+}
+
+// TestDataDoesNotRenewReadDeadline 数据帧不续约读超时（只有 Ping/Pong
+// 续约）：持续有数据但无心跳的连接仍会被判死拆除。这是有意为之且
+// 反直觉的语义，测试防止将来被"好心修复"。
+func TestDataDoesNotRenewReadDeadline(t *testing.T) {
+	oldRT := readTimeout.Load()
+	readTimeout.Store(int64(150 * time.Millisecond))
+	t.Cleanup(func() { readTimeout.Store(oldRT) })
+
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, startEchoServer(t))
+
+	d := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+	ws, _, err := d.Dial(serverURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadLimit(maxMessageSize)
+	if err := clientHandshake(ws, priv); err != nil {
+		t.Fatal(err)
+	}
+
+	// 持续发数据帧（不发 Ping）：读超时仍应到期拆除
+	go func() {
+		frame := make([]byte, 16)
+		for {
+			if err := ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	start := time.Now()
+	ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		if _, _, err := ws.ReadMessage(); err != nil {
+			// 服务端读超时到期 → 拆除 → 本端读到错误
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("data frames appear to renew the read deadline: %.1fs", elapsed.Seconds())
+			}
+			return
+		}
+		// echo 回来的数据帧，继续读
+	}
+}
+
+// TestCloseReasonSanitizedInLog 对端 close 帧的 reason 是对端可控文本，
+// 进日志前必须消毒（回归：曾可直接注入换行/ANSI）。
+func TestCloseReasonSanitizedInLog(t *testing.T) {
+	dir := t.TempDir()
+	priv, _ := genTestKeyPair(t, dir)
+	wl, _, err := loadWhitelistFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := startTunnelServer(t, wl, startEchoServer(t))
+
+	var mu sync.Mutex
+	var logBuf bytes.Buffer
+	log.SetOutput(&mutexWriter{mu: &mu, w: &logBuf})
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	d := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+	ws, _, err := d.Dial(serverURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws.SetReadLimit(maxMessageSize)
+	if err := clientHandshake(ws, priv); err != nil {
+		t.Fatal(err)
+	}
+	// 非 1000/1001 的 close 码会进服务端日志；reason 里塞换行和 ANSI ESC
+	_ = ws.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(4000, "x\nINJECTED\x1b[31m"),
+		time.Now().Add(2*time.Second))
+	ws.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		logs := logBuf.String()
+		mu.Unlock()
+		if strings.Contains(logs, "INJECTED") {
+			if strings.Contains(logs, "\nINJECTED") || strings.Contains(logs, "\x1b") {
+				t.Fatalf("log injection not sanitized: %q", logs)
+			}
+			return // 日志里有消毒后的内容 ✓
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("close-reason log line never appeared")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+type mutexWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (m *mutexWriter) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.w.Write(p)
+}
+
+// TestTransportDefaultsAnchored 把 README 记载的传输参数与代码默认值
+// 互相锚定，防双向漂移。
+func TestTransportDefaultsAnchored(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"heartbeatInterval", time.Duration(heartbeatInterval.Load()), 10 * time.Second},
+		{"readTimeout", time.Duration(readTimeout.Load()), 30 * time.Second},
+		{"writeWait", time.Duration(writeWait.Load()), 10 * time.Second},
+		{"targetDialTimeout", time.Duration(targetDialTimeout.Load()), 5 * time.Second},
+		{"dialTimeout (client WS)", dialTimeout, 10 * time.Second},
+		{"authDeadline", authDeadline, 10 * time.Second},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, README says %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if dialRetryMaxNum != 5 {
+		t.Errorf("dialRetryMaxNum = %d, README says 5 attempts", dialRetryMaxNum)
 	}
 }

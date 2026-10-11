@@ -177,7 +177,9 @@ func TestHandshakeMalformedAuth(t *testing.T) {
 	readFrame(t, ws) // nonce
 	ws.WriteMessage(websocket.BinaryMessage, []byte{0x99, 0x01, 0x02})
 	expectAuthFail(t, ws, "malformed handshake message")
-	waitResult(t, results)
+	if r := waitResult(t, results); r.err == nil {
+		t.Fatal("server should report the malformed auth frame")
+	}
 }
 
 func TestHandshakeEmptyWhitelist(t *testing.T) {
@@ -394,5 +396,7 @@ func TestHandshakeWrongLengthAuthRejected(t *testing.T) {
 	copy(bad[1:], ed25519.Sign(priv, nonceMsg[1:]))
 	ws.WriteMessage(websocket.BinaryMessage, bad)
 	expectAuthFail(t, ws, "malformed handshake message")
-	waitResult(t, results)
+	if r := waitResult(t, results); r.err == nil {
+		t.Fatal("server should report the wrong-length auth frame")
+	}
 }

@@ -205,6 +205,17 @@ func installHeartbeat(ws *websocket.Conn) {
 	})
 }
 
+// directionLabels 返回 bridge 的日志方向标签：dir1 = TCP→WS 协程，
+// dir2 = WS→TCP 主循环。server 端 TCP 连的是 target（S 侧）：
+// TCP→WS = S→C、WS→TCP = C→S；client 端 TCP 连本地应用（L 侧）：
+// TCP→WS = L→R、WS→TCP = R→L。client 侧本地 TCP 断开属正常，读错误静默。
+func directionLabels(serverSide bool) (dir1, dir2 string, logTCPErr bool) {
+	if serverSide {
+		return "S\u2192C", "C\u2192S", true
+	}
+	return "L\u2192R", "R\u2192L", false
+}
+
 // bridge 在 WS 与 TCP 之间双向转发数据。鉴权已完成，所有 BinaryMessage
 // 的 payload 即 TCP 字节。serverSide 决定日志方向（C→S/S→C 或 L→R/R→L）
 // 与 TCP 读错误的静默策略——client 侧本地断开属正常行为，静默。
@@ -218,15 +229,7 @@ func installHeartbeat(ws *websocket.Conn) {
 func bridge(ws *websocket.Conn, tcp net.Conn, ctx context.Context, cancel context.CancelFunc, serverSide bool, tag string) {
 	defer cancel()
 
-	// 方向标签：dir1 = TCP→WS 协程，dir2 = WS→TCP 主循环。
-	// server 端 TCP 连的是 target（S 侧）：TCP→WS = S→C，WS→TCP = C→S；
-	// client 端 TCP 连的是本地应用（L 侧）：TCP→WS = L→R，WS→TCP = R→L。
-	dir1, dir2 := "S\u2192C", "C\u2192S"
-	logTCPErr := serverSide
-	if !serverSide {
-		dir1, dir2 = "L\u2192R", "R\u2192L"
-		logTCPErr = false
-	}
+	dir1, dir2, logTCPErr := directionLabels(serverSide)
 
 	teardown := func() {
 		cancel()
