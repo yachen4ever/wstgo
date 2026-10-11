@@ -87,7 +87,7 @@ func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool, 
 			}
 			// 传输类错误（握手超时、对端恰在重启的 RST 等）按退避重试
 			lastErr = err
-			log.Printf("handshake attempt %d/%d failed: %v", attempt, dialRetryMaxNum, err)
+			log.Printf("handshake attempt %d/%d failed: %v", attempt, dialRetryMaxNum, sanitizeReason(err.Error()))
 			if attempt < dialRetryMaxNum {
 				time.Sleep(backoff)
 				backoff *= 2
@@ -99,7 +99,7 @@ func dialWithRetry(websocketURL string, priv ed25519.PrivateKey, insecure bool, 
 		}
 		// gorilla 约定：握手失败时调用方负责关闭 resp.Body
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
 		}
 		if errors.Is(err, websocket.ErrBadHandshake) && resp != nil && resp.StatusCode == http.StatusNotFound {
@@ -138,7 +138,9 @@ func startHeartbeat(ws *websocket.Conn, ctx context.Context, cancel context.Canc
 			err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Duration(writeWait.Load())))
 			if err != nil {
 				log.Printf("heartbeat ping failed: %v", err)
+				// cancel 唤不醒阻塞中的 ReadMessage，直接关 ws 立即触发拆除
 				cancel()
+				ws.Close()
 				return
 			}
 		case <-ctx.Done():

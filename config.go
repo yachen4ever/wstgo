@@ -98,9 +98,10 @@ func (c *Config) validate() error {
 		if !strings.HasPrefix(c.General.URL, "ws://") && !strings.HasPrefix(c.General.URL, "wss://") {
 			return errors.New(`config: general.url must start with "ws://" or "wss://"`)
 		}
-		// query 串会让标签拼进 query（<url>/<标签> 的拼接语义），必然 404，直接拒绝
-		if strings.Contains(c.General.URL, "?") {
-			return errors.New(`config: general.url must not contain a query string`)
+		// query/fragment 都会让标签拼不进路径（<url>/<标签> 的拼接语义），
+		// 必然 404 且排障误导，直接拒绝
+		if strings.ContainsAny(c.General.URL, "?#") {
+			return errors.New(`config: general.url must not contain a query string or fragment`)
 		}
 		if c.General.Key == "" {
 			return errors.New("config: general.key is required")

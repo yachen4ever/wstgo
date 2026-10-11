@@ -355,8 +355,20 @@ key = "/tmp/private.pem"
 [client.ssh1]
 bind = "127.0.0.1:50022"
 `))
-	if err == nil || !strings.Contains(err.Error(), "query string") {
+	if err == nil || !strings.Contains(err.Error(), "query string or fragment") {
 		t.Fatalf("url with query should be rejected, got %v", err)
+	}
+
+	_, err = loadConfig(writeTempConfig(t, `
+[general]
+run_mode = "client"
+url = "ws://tunnel.example.com/ws#x"
+key = "/tmp/private.pem"
+[client.ssh1]
+bind = "127.0.0.1:50022"
+`))
+	if err == nil || !strings.Contains(err.Error(), "query string or fragment") {
+		t.Fatalf("url with fragment should be rejected, got %v", err)
 	}
 }
 

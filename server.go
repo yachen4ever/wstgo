@@ -20,7 +20,7 @@ import (
 // 没有同步点——普通全局变量会被 race detector 判定为数据竞争。
 var (
 	heartbeatInterval atomic.Int64 // client 发 Ping 的间隔（默认 10s）
-	readTimeout       atomic.Int64 // 任意方向无消息即断开（默认 30s）；DB 场景宁可快速失败让应用重连
+	readTimeout       atomic.Int64 // Ping/Pong 停止续约 30s 即判死链（数据帧不续约读超时）；DB 场景宁可快速失败让应用重连
 	writeWait         atomic.Int64 // 单次 WS 写（数据/控制帧）的超时（默认 10s），防慢消费对端把数据写无限期阻塞
 	targetDialTimeout atomic.Int64 // 拨号 -target 的超时（默认 5s）；net.Dial 默认无超时，会挂到 OS 级 TCP 超时
 )
@@ -218,7 +218,10 @@ func installHeartbeat(ws *websocket.Conn) {
 func bridge(ws *websocket.Conn, tcp net.Conn, ctx context.Context, cancel context.CancelFunc, serverSide bool, tag string) {
 	defer cancel()
 
-	dir1, dir2 := "C\u2192S", "S\u2192C" // TCP→WS / WS→TCP 方向的日志前缀
+	// 方向标签：dir1 = TCP→WS 协程，dir2 = WS→TCP 主循环。
+	// server 端 TCP 连的是 target（S 侧）：TCP→WS = S→C，WS→TCP = C→S；
+	// client 端 TCP 连的是本地应用（L 侧）：TCP→WS = L→R，WS→TCP = R→L。
+	dir1, dir2 := "S\u2192C", "C\u2192S"
 	logTCPErr := serverSide
 	if !serverSide {
 		dir1, dir2 = "L\u2192R", "R\u2192L"
@@ -271,7 +274,8 @@ func bridge(ws *websocket.Conn, tcp net.Conn, ctx context.Context, cancel contex
 		msgType, buf, err := ws.ReadMessage()
 		if err != nil {
 			if serverSide || !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("%s%s read err: %v", dir2, tag, err)
+				// close 帧的 reason 是对端可控文本，消毒后再进日志
+				log.Printf("%s%s read err: %v", dir2, tag, sanitizeReason(err.Error()))
 			}
 			teardown()
 			return
